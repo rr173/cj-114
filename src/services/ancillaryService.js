@@ -165,6 +165,7 @@ function executeAncillaryClearing(tradingDayId) {
   const td = getTradingDayById(tradingDayId);
   if (!td) throw new Error('交易日不存在');
   if (td.status === 'bidding') throw new Error('现货市场尚未出清，不能执行辅助服务出清');
+  if (td.status === 'settled') throw new Error('该交易日已完成结算，不能再执行辅助服务出清');
 
   const existingClearing = db.prepare(
     'SELECT id FROM ancillary_clearing_results WHERE trading_day_id = ?'

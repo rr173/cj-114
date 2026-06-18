@@ -631,8 +631,9 @@ function getAnomalies(filters = {}) {
     params.push(filters.hour);
   }
   if (filters.participant_id) {
-    sql += ' AND sa.participant_id = ?';
+    sql += ` AND (sa.participant_id = ? OR (sa.anomaly_type = 'collusion_suspected' AND sa.metric_values LIKE ?))`;
     params.push(filters.participant_id);
+    params.push(`%"participant_id":"${filters.participant_id}"%`);
   }
   if (filters.anomaly_type) {
     sql += ' AND sa.anomaly_type = ?';
@@ -800,7 +801,7 @@ function generateRegulatoryReport(startDate, endDate, participantId = null) {
     }
   }
 
-  return {
+  const report = {
     report_period: { start_date: startDate, end_date: endDate },
     participant_filter: participantId || null,
     anomaly_summary: typeStats,
@@ -810,6 +811,47 @@ function generateRegulatoryReport(startDate, endDate, participantId = null) {
     total_anomalies: anomalies.length,
     total_alerts: alerts.length
   };
+
+  if (participantId) {
+    const typeCounts = {
+      price_inflation: 0,
+      volume_price_manipulation: 0,
+      collusion_suspected: 0
+    };
+    for (const a of anomalies) {
+      if (typeCounts[a.anomaly_type] !== undefined) {
+        typeCounts[a.anomaly_type]++;
+      }
+    }
+
+    const penaltySuggestions = [];
+    if (typeCounts.price_inflation >= 3) {
+      penaltySuggestions.push({
+        type: 'warning',
+        reason: `抬价行为${typeCounts.price_inflation}次，达到3次以上阈值`,
+        suggestion: '建议发出警告'
+      });
+    }
+    if (typeCounts.volume_price_manipulation >= 2) {
+      penaltySuggestions.push({
+        type: 'fine',
+        reason: `量价操纵行为${typeCounts.volume_price_manipulation}次，达到2次以上阈值`,
+        suggestion: '建议处以罚款'
+      });
+    }
+    if (typeCounts.collusion_suspected >= 1) {
+      penaltySuggestions.push({
+        type: 'investigation',
+        reason: `涉嫌串谋${typeCounts.collusion_suspected}次`,
+        suggestion: '建议立案调查'
+      });
+    }
+
+    report.penalty_suggestions = penaltySuggestions;
+    report.type_counts = typeCounts;
+  }
+
+  return report;
 }
 
 function getParticipantAnomalyHistory(participantId) {
