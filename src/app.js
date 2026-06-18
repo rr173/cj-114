@@ -8,6 +8,8 @@ const settlementRouter = require('./routes/settlement');
 const contractsRouter = require('./routes/contracts');
 const ancillaryServicesRouter = require('./routes/ancillaryServices');
 const supervisionRouter = require('./routes/supervision');
+const priceZonesRouter = require('./routes/priceZones');
+const tieLinesRouter = require('./routes/tieLines');
 
 const app = express();
 
@@ -21,6 +23,8 @@ app.use('/api/settlement', settlementRouter);
 app.use('/api/contracts', contractsRouter);
 app.use('/api/ancillary-services', ancillaryServicesRouter);
 app.use('/api/supervision', supervisionRouter);
+app.use('/api/price-zones', priceZonesRouter);
+app.use('/api/tie-lines', tieLinesRouter);
 
 app.get('/api/health', (req, res) => {
   res.json({

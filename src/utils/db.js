@@ -142,7 +142,7 @@ function initDatabase() {
       trading_day_id TEXT NOT NULL,
       participant_id TEXT NOT NULL,
       hour INTEGER NOT NULL CHECK(hour BETWEEN 0 AND 23),
-      item_type TEXT NOT NULL CHECK(item_type IN ('contract', 'spot', 'deviation')),
+      item_type TEXT NOT NULL CHECK(item_type IN ('contract', 'spot', 'deviation', 'congestion_surplus')),
       contract_id TEXT,
       volume REAL NOT NULL,
       direction TEXT,
@@ -274,6 +274,78 @@ function initDatabase() {
       FOREIGN KEY (participant_id) REFERENCES market_participants(id),
       UNIQUE(participant_id, month, service_type)
     );
+
+    CREATE TABLE IF NOT EXISTS price_zones (
+      id TEXT PRIMARY KEY,
+      code TEXT UNIQUE NOT NULL,
+      name TEXT NOT NULL,
+      description TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS price_zone_participants (
+      id TEXT PRIMARY KEY,
+      zone_id TEXT NOT NULL,
+      participant_id TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (zone_id) REFERENCES price_zones(id) ON DELETE CASCADE,
+      FOREIGN KEY (participant_id) REFERENCES market_participants(id) ON DELETE CASCADE,
+      UNIQUE(zone_id, participant_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS tie_lines (
+      id TEXT PRIMARY KEY,
+      code TEXT UNIQUE NOT NULL,
+      name TEXT NOT NULL,
+      from_zone_id TEXT NOT NULL,
+      to_zone_id TEXT NOT NULL,
+      max_transfer_capacity REAL NOT NULL,
+      description TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (from_zone_id) REFERENCES price_zones(id),
+      FOREIGN KEY (to_zone_id) REFERENCES price_zones(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS zone_clearing_results (
+      id TEXT PRIMARY KEY,
+      clearing_result_id TEXT NOT NULL,
+      zone_id TEXT NOT NULL,
+      clearing_price REAL NOT NULL,
+      clearing_volume REAL NOT NULL,
+      net_export REAL NOT NULL DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (clearing_result_id) REFERENCES clearing_results(id) ON DELETE CASCADE,
+      FOREIGN KEY (zone_id) REFERENCES price_zones(id),
+      UNIQUE(clearing_result_id, zone_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS tie_line_flows (
+      id TEXT PRIMARY KEY,
+      clearing_result_id TEXT NOT NULL,
+      tie_line_id TEXT NOT NULL,
+      flow_direction TEXT NOT NULL CHECK(flow_direction IN ('forward', 'reverse', 'zero')),
+      actual_flow REAL NOT NULL DEFAULT 0,
+      congestion_level REAL NOT NULL DEFAULT 0,
+      is_congested INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (clearing_result_id) REFERENCES clearing_results(id) ON DELETE CASCADE,
+      FOREIGN KEY (tie_line_id) REFERENCES tie_lines(id),
+      UNIQUE(clearing_result_id, tie_line_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS congestion_surplus (
+      id TEXT PRIMARY KEY,
+      trading_day_id TEXT NOT NULL,
+      hour INTEGER NOT NULL CHECK(hour BETWEEN 0 AND 23),
+      tie_line_id TEXT NOT NULL,
+      total_surplus REAL NOT NULL DEFAULT 0,
+      from_zone_share REAL NOT NULL DEFAULT 0,
+      to_zone_share REAL NOT NULL DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (trading_day_id) REFERENCES trading_days(id),
+      FOREIGN KEY (tie_line_id) REFERENCES tie_lines(id),
+      UNIQUE(trading_day_id, hour, tie_line_id)
+    );
   `);
 }
 
@@ -282,5 +354,6 @@ initDatabase();
 try { db.exec(`ALTER TABLE trading_days ADD COLUMN frequency_demand REAL`); } catch (e) {}
 try { db.exec(`ALTER TABLE trading_days ADD COLUMN reserve_demand REAL`); } catch (e) {}
 try { db.exec(`ALTER TABLE settlement_details ADD COLUMN exempt_amount REAL DEFAULT 0`); } catch (e) {}
+try { db.exec(`ALTER TABLE clearing_results ADD COLUMN clearing_type TEXT DEFAULT 'unified' CHECK(clearing_type IN ('unified', 'zoned'))`); } catch (e) {}
 
 module.exports = db;

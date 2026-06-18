@@ -3,6 +3,7 @@ const db = require('../utils/db');
 const { getTradingDayById, getTradingDayByDate } = require('./tradingDayService');
 const { listParticipants, getParticipantById } = require('./participantService');
 const { decomposeContractsForDate, getDecompositionByDate } = require('./contractService');
+const { getParticipantZone, listPriceZones } = require('./priceZoneService');
 
 const POSITIVE_DEVIATION_RATIO = 0.8;
 const NEGATIVE_DEVIATION_RATIO = 1.2;
@@ -68,6 +69,34 @@ function getActualVolumes(tradingDayId, participantId) {
   `).all(tradingDayId, participantId);
 }
 
+function getZoneClearingPrices(tradingDayId) {
+  const zonePrices = {};
+  const rows = db.prepare(`
+    SELECT cr.hour, zcr.zone_id, zcr.clearing_price
+    FROM zone_clearing_results zcr
+    JOIN clearing_results cr ON zcr.clearing_result_id = cr.id
+    WHERE cr.trading_day_id = ?
+  `).all(tradingDayId);
+
+  for (const row of rows) {
+    if (!zonePrices[row.hour]) zonePrices[row.hour] = {};
+    zonePrices[row.hour][row.zone_id] = row.clearing_price;
+  }
+  return zonePrices;
+}
+
+function getClearingTypes(tradingDayId) {
+  const types = {};
+  const rows = db.prepare(`
+    SELECT hour, clearing_type FROM clearing_results
+    WHERE trading_day_id = ?
+  `).all(tradingDayId);
+  for (const row of rows) {
+    types[row.hour] = row.clearing_type || 'unified';
+  }
+  return types;
+}
+
 function executeSettlement(tradingDayId) {
   const td = getTradingDayById(tradingDayId);
   if (!td) {
@@ -80,7 +109,7 @@ function executeSettlement(tradingDayId) {
   decomposeContractsForDate(td.trade_date);
 
   const allocations = db.prepare(`
-    SELECT cr.hour, cr.clearing_price,
+    SELECT cr.hour, cr.clearing_price, cr.clearing_type,
            ca.participant_id, ca.final_dispatch,
            p.type
     FROM clearing_results cr
@@ -89,6 +118,9 @@ function executeSettlement(tradingDayId) {
     WHERE cr.trading_day_id = ?
     ORDER BY cr.hour, p.type
   `).all(tradingDayId);
+
+  const zonePrices = getZoneClearingPrices(tradingDayId);
+  const clearingTypes = getClearingTypes(tradingDayId);
 
   const actualVolumes = db.prepare(`
     SELECT participant_id, hour, actual_volume
@@ -177,7 +209,16 @@ function executeSettlement(tradingDayId) {
       for (let h = 0; h < 24; h++) {
         const spotAlloc = spotAllocMap[partId]?.[h];
         const spotVolume = spotAlloc?.final_dispatch || 0;
-        const clearingPrice = spotAlloc?.clearing_price || 0;
+        const clearingType = clearingTypes[h] || 'unified';
+        let clearingPrice = spotAlloc?.clearing_price || 0;
+
+        if (clearingType === 'zoned' && zonePrices[h]) {
+          const zone = getParticipantZone(partId);
+          if (zone && zonePrices[h][zone.id]) {
+            clearingPrice = zonePrices[h][zone.id];
+          }
+        }
+
         const partType = participant.type;
 
         const contractItems = contractMap[partId]?.[h] || [];
@@ -256,6 +297,70 @@ function executeSettlement(tradingDayId) {
       }
     }
 
+    const congestionSurpluses = db.prepare(`
+      SELECT cs.*, tl.from_zone_id, tl.to_zone_id
+      FROM congestion_surplus cs
+      JOIN tie_lines tl ON cs.tie_line_id = tl.id
+      WHERE cs.trading_day_id = ?
+    `).all(tradingDayId);
+
+    if (congestionSurpluses.length > 0) {
+      const zones = listPriceZones();
+      const zoneParticipantVolumes = {};
+
+      for (const zone of zones) {
+        zoneParticipantVolumes[zone.id] = {};
+        for (const p of zone.participants) {
+          zoneParticipantVolumes[zone.id][p.id] = 0;
+        }
+      }
+
+      for (let h = 0; h < 24; h++) {
+        for (const alloc of allocations) {
+          if (alloc.hour === h && alloc.final_dispatch > 0) {
+            const zone = getParticipantZone(alloc.participant_id);
+            if (zone && zoneParticipantVolumes[zone.id]) {
+              zoneParticipantVolumes[zone.id][alloc.participant_id] += alloc.final_dispatch;
+            }
+          }
+        }
+      }
+
+      for (const cs of congestionSurpluses) {
+        if (cs.total_surplus <= 0) continue;
+
+        const fromZoneParticipants = zoneParticipantVolumes[cs.from_zone_id] || {};
+        const toZoneParticipants = zoneParticipantVolumes[cs.to_zone_id] || {};
+
+        const fromTotalVol = Object.values(fromZoneParticipants).reduce((s, v) => s + v, 0);
+        const toTotalVol = Object.values(toZoneParticipants).reduce((s, v) => s + v, 0);
+
+        if (fromTotalVol > 0) {
+          for (const [pid, vol] of Object.entries(fromZoneParticipants)) {
+            if (vol > 0) {
+              const share = (vol / fromTotalVol) * cs.from_zone_share;
+              insertStmt.run(
+                uuidv4(), tradingDayId, pid, cs.hour, 'congestion_surplus', null,
+                vol, 'refund', 0, share, 0
+              );
+            }
+          }
+        }
+
+        if (toTotalVol > 0) {
+          for (const [pid, vol] of Object.entries(toZoneParticipants)) {
+            if (vol > 0) {
+              const share = (vol / toTotalVol) * cs.to_zone_share;
+              insertStmt.run(
+                uuidv4(), tradingDayId, pid, cs.hour, 'congestion_surplus', null,
+                vol, 'refund', 0, share, 0
+              );
+            }
+          }
+        }
+      }
+    }
+
     db.prepare('UPDATE trading_days SET status = ? WHERE id = ?').run('settled', tradingDayId);
   });
 
@@ -270,6 +375,7 @@ function _buildSettlementResponse(tradingDayId, rows, td) {
   let totalContractAmount = 0;
   let totalSpotAmount = 0;
   let totalDeviationAmount = 0;
+  let totalCongestionSurplus = 0;
 
   for (const row of rows) {
     if (!byParticipant[row.participant_id]) {
@@ -285,6 +391,7 @@ function _buildSettlementResponse(tradingDayId, rows, td) {
         total_contract_amount: 0,
         total_spot_amount: 0,
         total_deviation_amount: 0,
+        total_congestion_surplus: 0,
         total_settlement_amount: 0,
         hourly: []
       };
@@ -304,6 +411,9 @@ function _buildSettlementResponse(tradingDayId, rows, td) {
     } else if (row.item_type === 'deviation') {
       p.total_deviation_amount += row.amount;
       totalDeviationAmount += row.amount;
+    } else if (row.item_type === 'congestion_surplus') {
+      p.total_congestion_surplus += row.amount;
+      totalCongestionSurplus += row.amount;
     }
     p.total_settlement_amount += row.amount;
     totalAmount += row.amount;
@@ -322,6 +432,7 @@ function _buildSettlementResponse(tradingDayId, rows, td) {
       }));
       const spotItem = hourRows.find(r => r.item_type === 'spot');
       const devItem = hourRows.find(r => r.item_type === 'deviation');
+      const congestionItem = hourRows.find(r => r.item_type === 'congestion_surplus');
 
       p.hourly.push({
         hour: h,
@@ -338,6 +449,11 @@ function _buildSettlementResponse(tradingDayId, rows, td) {
           unit_price: devItem.unit_price,
           amount: devItem.amount,
           exempt_amount: devItem.exempt_amount || 0
+        } : null,
+        congestion_surplus: congestionItem ? {
+          volume: congestionItem.volume,
+          direction: congestionItem.direction,
+          amount: congestionItem.amount
         } : null
       });
     }
@@ -357,6 +473,7 @@ function _buildSettlementResponse(tradingDayId, rows, td) {
       total_contract_amount: totalContractAmount,
       total_spot_amount: totalSpotAmount,
       total_deviation_amount: totalDeviationAmount,
+      total_congestion_surplus: totalCongestionSurplus,
       total_settlement_amount: totalAmount
     },
     participants: Object.values(byParticipant)
@@ -484,7 +601,7 @@ function getFullParticipantReport(tradingDayId, participantId) {
 
   const hourly = [];
   let totalSpot = 0, totalActual = 0, totalContract = 0;
-  let totalContractAmt = 0, totalSpotAmt = 0, totalDevAmt = 0;
+  let totalContractAmt = 0, totalSpotAmt = 0, totalDevAmt = 0, totalCongestionAmt = 0;
   for (let h = 0; h < 24; h++) {
     const item = hourlyMap[h];
     hourly.push(item);
@@ -496,6 +613,7 @@ function getFullParticipantReport(tradingDayId, participantId) {
         if (si.item_type === 'contract') totalContractAmt += si.amount;
         else if (si.item_type === 'spot') totalSpotAmt += si.amount;
         else if (si.item_type === 'deviation') totalDevAmt += si.amount;
+        else if (si.item_type === 'congestion_surplus') totalCongestionAmt += si.amount;
       }
     }
   }
@@ -512,7 +630,8 @@ function getFullParticipantReport(tradingDayId, participantId) {
       total_contract_settlement: totalContractAmt,
       total_spot_settlement: totalSpotAmt,
       total_deviation_settlement: totalDevAmt,
-      total_settlement_amount: totalContractAmt + totalSpotAmt + totalDevAmt
+      total_congestion_surplus: totalCongestionAmt,
+      total_settlement_amount: totalContractAmt + totalSpotAmt + totalDevAmt + totalCongestionAmt
     },
     hourly
   };
