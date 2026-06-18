@@ -1,7 +1,8 @@
 const { v4: uuidv4 } = require('uuid');
 const db = require('../utils/db');
-const { getTradingDayById } = require('./tradingDayService');
+const { getTradingDayById, getTradingDayByDate } = require('./tradingDayService');
 const { listParticipants, getParticipantById } = require('./participantService');
+const { decomposeContractsForDate, getDecompositionByDate } = require('./contractService');
 
 const POSITIVE_DEVIATION_RATIO = 0.8;
 const NEGATIVE_DEVIATION_RATIO = 1.2;
@@ -76,6 +77,8 @@ function executeSettlement(tradingDayId) {
     throw new Error('只有已出清的交易日可以执行结算');
   }
 
+  decomposeContractsForDate(td.trade_date);
+
   const allocations = db.prepare(`
     SELECT cr.hour, cr.clearing_price,
            ca.participant_id, ca.final_dispatch,
@@ -116,58 +119,122 @@ function executeSettlement(tradingDayId) {
     throw new Error(`以下主体时段缺少实际量数据: ${missing.join(', ')}`);
   }
 
+  const decomposition = getDecompositionByDate(td.trade_date);
+
+  const contractMap = {};
+  for (const d of decomposition) {
+    if (!contractMap[d.buyer_id]) contractMap[d.buyer_id] = {};
+    if (!contractMap[d.seller_id]) contractMap[d.seller_id] = {};
+    if (!contractMap[d.buyer_id][d.hour]) contractMap[d.buyer_id][d.hour] = [];
+    if (!contractMap[d.seller_id][d.hour]) contractMap[d.seller_id][d.hour] = [];
+    contractMap[d.buyer_id][d.hour].push({ ...d, side: 'buyer' });
+    contractMap[d.seller_id][d.hour].push({ ...d, side: 'seller' });
+  }
+
+  const contractPriceMap = {};
+  const contracts = db.prepare('SELECT id, contract_price FROM mid_long_term_contracts').all();
+  for (const c of contracts) contractPriceMap[c.id] = c.contract_price;
+
   const tx = db.transaction(() => {
     db.prepare('DELETE FROM settlement_details WHERE trading_day_id = ?').run(tradingDayId);
 
     const insertStmt = db.prepare(`
       INSERT INTO settlement_details
-      (id, trading_day_id, participant_id, hour, bid_volume, actual_volume,
-       deviation, deviation_direction, clearing_price, settlement_price, settlement_amount)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (id, trading_day_id, participant_id, hour, item_type, contract_id,
+       volume, direction, unit_price, amount)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
+    const spotAllocMap = {};
     for (const alloc of allocations) {
-      const bidVolume = alloc.final_dispatch || 0;
-      const actualVolume = actualMap[alloc.participant_id]?.[alloc.hour] || 0;
+      if (!spotAllocMap[alloc.participant_id]) spotAllocMap[alloc.participant_id] = {};
+      spotAllocMap[alloc.participant_id][alloc.hour] = alloc;
+    }
 
-      let deviation = actualVolume - bidVolume;
-      if (alloc.type === 'consumer') {
-        deviation = bidVolume - actualVolume;
+    const allPartIds = new Set();
+    for (const a of allocations) allPartIds.add(a.participant_id);
+    for (const d of decomposition) {
+      allPartIds.add(d.buyer_id);
+      allPartIds.add(d.seller_id);
+    }
+
+    for (const partId of allPartIds) {
+      const participant = getParticipantById(partId);
+      if (!participant) continue;
+
+      for (let h = 0; h < 24; h++) {
+        const spotAlloc = spotAllocMap[partId]?.[h];
+        const spotVolume = spotAlloc?.final_dispatch || 0;
+        const clearingPrice = spotAlloc?.clearing_price || 0;
+        const partType = participant.type;
+
+        const contractItems = contractMap[partId]?.[h] || [];
+        let totalContractVolume = 0;
+        for (const ci of contractItems) {
+          totalContractVolume += ci.decomposed_energy;
+        }
+
+        const actualVolume = actualMap[partId]?.[h] || 0;
+        const totalObligation = spotVolume + totalContractVolume;
+
+        let deviation;
+        if (partType === 'generator') {
+          deviation = actualVolume - totalObligation;
+        } else {
+          deviation = totalObligation - actualVolume;
+        }
+
+        for (const ci of contractItems) {
+          const contractPrice = contractPriceMap[ci.contract_id] || 0;
+          let vol, amount;
+          if (ci.side === 'buyer') {
+            vol = ci.decomposed_energy;
+            amount = vol * contractPrice;
+          } else {
+            vol = ci.decomposed_energy;
+            amount = -vol * contractPrice;
+          }
+          insertStmt.run(
+            uuidv4(), tradingDayId, partId, h, 'contract', ci.contract_id,
+            vol, ci.side, contractPrice, amount
+          );
+        }
+
+        if (spotVolume > 0 || (spotAlloc && spotAlloc.final_dispatch != null)) {
+          let spotAmount;
+          if (partType === 'generator') {
+            spotAmount = -spotVolume * clearingPrice;
+          } else {
+            spotAmount = spotVolume * clearingPrice;
+          }
+          insertStmt.run(
+            uuidv4(), tradingDayId, partId, h, 'spot', null,
+            spotVolume, partType === 'generator' ? 'sell' : 'buy', clearingPrice, spotAmount
+          );
+        }
+
+        const EPSILON = 0.0001;
+        if (Math.abs(deviation) >= EPSILON) {
+          let deviationDirection;
+          let settlementPrice;
+
+          if (deviation > 0) {
+            deviationDirection = 'positive';
+            settlementPrice = clearingPrice * POSITIVE_DEVIATION_RATIO;
+          } else {
+            deviationDirection = 'negative';
+            settlementPrice = clearingPrice * NEGATIVE_DEVIATION_RATIO;
+          }
+
+          const absDeviation = Math.abs(deviation);
+          const settlementAmount = absDeviation * (settlementPrice - clearingPrice);
+
+          insertStmt.run(
+            uuidv4(), tradingDayId, partId, h, 'deviation', null,
+            absDeviation, deviationDirection, settlementPrice, settlementAmount
+          );
+        }
       }
-
-      let deviationDirection;
-      let settlementPrice;
-      const clearingPrice = alloc.clearing_price || 0;
-
-      const EPSILON = 0.0001;
-      if (Math.abs(deviation) < EPSILON) {
-        deviationDirection = 'zero';
-        settlementPrice = clearingPrice;
-        deviation = 0;
-      } else if (deviation > 0) {
-        deviationDirection = 'positive';
-        settlementPrice = clearingPrice * POSITIVE_DEVIATION_RATIO;
-      } else {
-        deviationDirection = 'negative';
-        settlementPrice = clearingPrice * NEGATIVE_DEVIATION_RATIO;
-      }
-
-      const absDeviation = Math.abs(deviation);
-      const settlementAmount = absDeviation * (settlementPrice - clearingPrice);
-
-      insertStmt.run(
-        uuidv4(),
-        tradingDayId,
-        alloc.participant_id,
-        alloc.hour,
-        bidVolume,
-        actualVolume,
-        deviation,
-        deviationDirection,
-        clearingPrice,
-        settlementPrice,
-        settlementAmount
-      );
     }
 
     db.prepare('UPDATE trading_days SET status = ? WHERE id = ?').run('settled', tradingDayId);
@@ -176,6 +243,104 @@ function executeSettlement(tradingDayId) {
   tx();
 
   return getSettlementByTradingDay(tradingDayId);
+}
+
+function _buildSettlementResponse(tradingDayId, rows, td) {
+  const byParticipant = {};
+  let totalAmount = 0;
+  let totalContractAmount = 0;
+  let totalSpotAmount = 0;
+  let totalDeviationAmount = 0;
+
+  for (const row of rows) {
+    if (!byParticipant[row.participant_id]) {
+      byParticipant[row.participant_id] = {
+        participant_id: row.participant_id,
+        code: row.code,
+        name: row.name,
+        type: row.type,
+        total_spot_volume: 0,
+        total_contract_volume: 0,
+        total_actual: 0,
+        total_deviation: 0,
+        total_contract_amount: 0,
+        total_spot_amount: 0,
+        total_deviation_amount: 0,
+        total_settlement_amount: 0,
+        hourly: []
+      };
+    }
+
+    const p = byParticipant[row.participant_id];
+    if (row.item_type === 'spot') p.total_spot_volume += row.volume;
+    if (row.item_type === 'contract') p.total_contract_volume += row.volume;
+    if (row.item_type === 'deviation') p.total_deviation += row.volume;
+
+    if (row.item_type === 'contract') {
+      p.total_contract_amount += row.amount;
+      totalContractAmount += row.amount;
+    } else if (row.item_type === 'spot') {
+      p.total_spot_amount += row.amount;
+      totalSpotAmount += row.amount;
+    } else if (row.item_type === 'deviation') {
+      p.total_deviation_amount += row.amount;
+      totalDeviationAmount += row.amount;
+    }
+    p.total_settlement_amount += row.amount;
+    totalAmount += row.amount;
+  }
+
+  for (const partId in byParticipant) {
+    const p = byParticipant[partId];
+    for (let h = 0; h < 24; h++) {
+      const hourRows = rows.filter(r => r.participant_id === partId && r.hour === h);
+      const contractItems = hourRows.filter(r => r.item_type === 'contract').map(r => ({
+        contract_id: r.contract_id,
+        volume: r.volume,
+        direction: r.direction,
+        unit_price: r.unit_price,
+        amount: r.amount
+      }));
+      const spotItem = hourRows.find(r => r.item_type === 'spot');
+      const devItem = hourRows.find(r => r.item_type === 'deviation');
+
+      p.hourly.push({
+        hour: h,
+        contract: contractItems,
+        spot: spotItem ? {
+          volume: spotItem.volume,
+          direction: spotItem.direction,
+          unit_price: spotItem.unit_price,
+          amount: spotItem.amount
+        } : null,
+        deviation: devItem ? {
+          volume: devItem.volume,
+          direction: devItem.direction,
+          unit_price: devItem.unit_price,
+          amount: devItem.amount
+        } : null
+      });
+    }
+
+    const actualList = db.prepare(`
+      SELECT hour, actual_volume FROM actual_volumes
+      WHERE trading_day_id = ? AND participant_id = ?
+    `).all(tradingDayId, partId);
+    for (const a of actualList) p.total_actual += a.actual_volume;
+  }
+
+  return {
+    trading_day_id: tradingDayId,
+    trade_date: td.trade_date,
+    status: td.status,
+    summary: {
+      total_contract_amount: totalContractAmount,
+      total_spot_amount: totalSpotAmount,
+      total_deviation_amount: totalDeviationAmount,
+      total_settlement_amount: totalAmount
+    },
+    participants: Object.values(byParticipant)
+  };
 }
 
 function getSettlementByTradingDay(tradingDayId) {
@@ -187,52 +352,10 @@ function getSettlementByTradingDay(tradingDayId) {
     FROM settlement_details s
     JOIN market_participants p ON s.participant_id = p.id
     WHERE s.trading_day_id = ?
-    ORDER BY s.hour, p.type, p.code
+    ORDER BY s.hour, p.type, p.code, s.item_type
   `).all(tradingDayId);
 
-  const byParticipant = {};
-  const byHour = {};
-  let totalAmount = 0;
-
-  for (const row of rows) {
-    if (!byParticipant[row.participant_id]) {
-      byParticipant[row.participant_id] = {
-        participant_id: row.participant_id,
-        code: row.code,
-        name: row.name,
-        type: row.type,
-        total_bid: 0,
-        total_actual: 0,
-        total_deviation: 0,
-        total_settlement_amount: 0,
-        hourly: []
-      };
-    }
-    byParticipant[row.participant_id].total_bid += row.bid_volume;
-    byParticipant[row.participant_id].total_actual += row.actual_volume;
-    byParticipant[row.participant_id].total_deviation += row.deviation;
-    byParticipant[row.participant_id].total_settlement_amount += row.settlement_amount;
-    byParticipant[row.participant_id].hourly.push({
-      hour: row.hour,
-      bid_volume: row.bid_volume,
-      actual_volume: row.actual_volume,
-      deviation: row.deviation,
-      deviation_direction: row.deviation_direction,
-      clearing_price: row.clearing_price,
-      settlement_price: row.settlement_price,
-      settlement_amount: row.settlement_amount
-    });
-
-    totalAmount += row.settlement_amount;
-  }
-
-  return {
-    trading_day_id: tradingDayId,
-    trade_date: td.trade_date,
-    status: td.status,
-    total_settlement_amount: totalAmount,
-    participants: Object.values(byParticipant)
-  };
+  return _buildSettlementResponse(tradingDayId, rows, td);
 }
 
 function getSettlementByParticipant(tradingDayId, participantId) {
@@ -242,30 +365,19 @@ function getSettlementByParticipant(tradingDayId, participantId) {
   if (!p) throw new Error('市场主体不存在');
 
   const rows = db.prepare(`
-    SELECT * FROM settlement_details
-    WHERE trading_day_id = ? AND participant_id = ?
-    ORDER BY hour
+    SELECT s.*, part.code, part.name, part.type
+    FROM settlement_details s
+    JOIN market_participants part ON s.participant_id = part.id
+    WHERE s.trading_day_id = ? AND s.participant_id = ?
+    ORDER BY s.hour, s.item_type
   `).all(tradingDayId, participantId);
 
-  let totalBid = 0, totalActual = 0, totalDeviation = 0, totalAmount = 0;
-  for (const row of rows) {
-    totalBid += row.bid_volume;
-    totalActual += row.actual_volume;
-    totalDeviation += row.deviation;
-    totalAmount += row.settlement_amount;
-  }
-
+  const resp = _buildSettlementResponse(tradingDayId, rows, td);
   return {
     participant: p,
     trade_date: td.trade_date,
     status: td.status,
-    summary: {
-      total_bid: totalBid,
-      total_actual: totalActual,
-      total_deviation: totalDeviation,
-      total_settlement_amount: totalAmount
-    },
-    details: rows
+    data: resp.participants[0] || null
   };
 }
 
@@ -291,42 +403,80 @@ function getFullParticipantReport(tradingDayId, participantId) {
     ORDER BY hour
   `).all(tradingDayId, participantId);
 
+  const decomposition = getDecompositionByDate(td.trade_date);
+  const contractRows = decomposition.filter(
+    d => d.buyer_id === participantId || d.seller_id === participantId
+  );
+
   const settlementRows = db.prepare(`
-    SELECT hour, bid_volume, actual_volume, deviation, deviation_direction,
-           clearing_price, settlement_price, settlement_amount
+    SELECT hour, item_type, contract_id, volume, direction, unit_price, amount
     FROM settlement_details
     WHERE trading_day_id = ? AND participant_id = ?
-    ORDER BY hour
+    ORDER BY hour, item_type
   `).all(tradingDayId, participantId);
 
   const hourlyMap = {};
-  for (let h = 0; h < 24; h++) hourlyMap[h] = { hour: h };
+  for (let h = 0; h < 24; h++) hourlyMap[h] = {
+    hour: h,
+    contract_volume: 0,
+    contract_items: []
+  };
 
   for (const r of clearingRows) {
-    hourlyMap[r.hour] = { ...hourlyMap[r.hour], clearing_price: r.clearing_price,
-      initial_allocation: r.initial_allocation, adjusted_allocation: r.adjusted_allocation,
-      final_dispatch: r.final_dispatch, adjustment_reason: r.adjustment_reason };
+    hourlyMap[r.hour] = {
+      ...hourlyMap[r.hour],
+      clearing_price: r.clearing_price,
+      initial_allocation: r.initial_allocation,
+      adjusted_allocation: r.adjusted_allocation,
+      final_dispatch: r.final_dispatch,
+      adjustment_reason: r.adjustment_reason
+    };
   }
   for (const r of actualRows) {
-    hourlyMap[r.hour] = { ...hourlyMap[r.hour], actual_volume: r.actual_volume };
+    hourlyMap[r.hour].actual_volume = r.actual_volume;
   }
-  for (const r of settlementRows) {
-    hourlyMap[r.hour] = { ...hourlyMap[r.hour],
-      bid_volume: r.bid_volume, deviation: r.deviation,
-      deviation_direction: r.deviation_direction, settlement_price: r.settlement_price,
-      settlement_amount: r.settlement_amount };
+  for (const c of contractRows) {
+    const side = c.buyer_id === participantId ? 'buyer' : 'seller';
+    hourlyMap[c.hour].contract_volume += c.decomposed_energy;
+    hourlyMap[c.hour].contract_items.push({
+      contract_id: c.contract_id,
+      contract_no: c.contract_no,
+      counterparty: side === 'buyer'
+        ? { id: c.seller_id, code: c.seller_code, name: c.seller_name }
+        : { id: c.buyer_id, code: c.buyer_code, name: c.buyer_name },
+      side: side,
+      decomposed_energy: c.decomposed_energy
+    });
+  }
+
+  for (const s of settlementRows) {
+    if (!hourlyMap[s.hour].settlement_items) hourlyMap[s.hour].settlement_items = [];
+    hourlyMap[s.hour].settlement_items.push({
+      item_type: s.item_type,
+      contract_id: s.contract_id,
+      volume: s.volume,
+      direction: s.direction,
+      unit_price: s.unit_price,
+      amount: s.amount
+    });
   }
 
   const hourly = [];
-  let totalBid = 0, totalActual = 0, totalDeviation = 0, totalSettlement = 0, totalClearing = 0;
+  let totalSpot = 0, totalActual = 0, totalContract = 0;
+  let totalContractAmt = 0, totalSpotAmt = 0, totalDevAmt = 0;
   for (let h = 0; h < 24; h++) {
     const item = hourlyMap[h];
     hourly.push(item);
-    if (item.final_dispatch) totalBid += item.final_dispatch;
+    if (item.final_dispatch) totalSpot += item.final_dispatch;
     if (item.actual_volume) totalActual += item.actual_volume;
-    if (item.deviation) totalDeviation += item.deviation;
-    if (item.settlement_amount) totalSettlement += item.settlement_amount;
-    if (item.final_dispatch && item.clearing_price) totalClearing += item.final_dispatch * item.clearing_price;
+    if (item.contract_volume) totalContract += item.contract_volume;
+    if (item.settlement_items) {
+      for (const si of item.settlement_items) {
+        if (si.item_type === 'contract') totalContractAmt += si.amount;
+        else if (si.item_type === 'spot') totalSpotAmt += si.amount;
+        else if (si.item_type === 'deviation') totalDevAmt += si.amount;
+      }
+    }
   }
 
   return {
@@ -334,11 +484,14 @@ function getFullParticipantReport(tradingDayId, participantId) {
     trade_date: td.trade_date,
     status: td.status,
     summary: {
-      total_bid_volume: totalBid,
+      total_spot_volume: totalSpot,
+      total_contract_volume: totalContract,
+      total_obligation: totalSpot + totalContract,
       total_actual_volume: totalActual,
-      total_deviation: totalDeviation,
-      total_clearing_amount: totalClearing,
-      total_deviation_settlement: totalSettlement
+      total_contract_settlement: totalContractAmt,
+      total_spot_settlement: totalSpotAmt,
+      total_deviation_settlement: totalDevAmt,
+      total_settlement_amount: totalContractAmt + totalSpotAmt + totalDevAmt
     },
     hourly
   };

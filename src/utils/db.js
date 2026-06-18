@@ -93,22 +93,65 @@ function initDatabase() {
       UNIQUE(trading_day_id, participant_id, hour)
     );
 
+    CREATE TABLE IF NOT EXISTS mid_long_term_contracts (
+      id TEXT PRIMARY KEY,
+      contract_no TEXT UNIQUE NOT NULL,
+      buyer_id TEXT NOT NULL,
+      seller_id TEXT NOT NULL,
+      start_date TEXT NOT NULL,
+      end_date TEXT NOT NULL,
+      termination_date TEXT,
+      total_energy REAL NOT NULL,
+      contract_price REAL NOT NULL,
+      decomposition_method TEXT NOT NULL CHECK(decomposition_method IN ('average', 'curve')),
+      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'terminated')),
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (buyer_id) REFERENCES market_participants(id),
+      FOREIGN KEY (seller_id) REFERENCES market_participants(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS contract_decomposition_curves (
+      id TEXT PRIMARY KEY,
+      contract_id TEXT NOT NULL,
+      hour INTEGER NOT NULL CHECK(hour BETWEEN 0 AND 23),
+      ratio REAL NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (contract_id) REFERENCES mid_long_term_contracts(id) ON DELETE CASCADE,
+      UNIQUE(contract_id, hour)
+    );
+
+    CREATE TABLE IF NOT EXISTS contract_decomposition_results (
+      id TEXT PRIMARY KEY,
+      contract_id TEXT NOT NULL,
+      trading_day_id TEXT,
+      trade_date TEXT NOT NULL,
+      hour INTEGER NOT NULL CHECK(hour BETWEEN 0 AND 23),
+      decomposed_energy REAL NOT NULL,
+      buyer_id TEXT NOT NULL,
+      seller_id TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (contract_id) REFERENCES mid_long_term_contracts(id),
+      FOREIGN KEY (trading_day_id) REFERENCES trading_days(id),
+      FOREIGN KEY (buyer_id) REFERENCES market_participants(id),
+      FOREIGN KEY (seller_id) REFERENCES market_participants(id),
+      UNIQUE(contract_id, trade_date, hour)
+    );
+
     CREATE TABLE IF NOT EXISTS settlement_details (
       id TEXT PRIMARY KEY,
       trading_day_id TEXT NOT NULL,
       participant_id TEXT NOT NULL,
       hour INTEGER NOT NULL CHECK(hour BETWEEN 0 AND 23),
-      bid_volume REAL NOT NULL,
-      actual_volume REAL NOT NULL,
-      deviation REAL NOT NULL,
-      deviation_direction TEXT NOT NULL CHECK(deviation_direction IN ('positive', 'negative', 'zero')),
-      clearing_price REAL NOT NULL,
-      settlement_price REAL NOT NULL,
-      settlement_amount REAL NOT NULL,
+      item_type TEXT NOT NULL CHECK(item_type IN ('contract', 'spot', 'deviation')),
+      contract_id TEXT,
+      volume REAL NOT NULL,
+      direction TEXT,
+      unit_price REAL NOT NULL,
+      amount REAL NOT NULL,
       created_at TEXT DEFAULT (datetime('now')),
       FOREIGN KEY (trading_day_id) REFERENCES trading_days(id),
       FOREIGN KEY (participant_id) REFERENCES market_participants(id),
-      UNIQUE(trading_day_id, participant_id, hour)
+      FOREIGN KEY (contract_id) REFERENCES mid_long_term_contracts(id)
     );
   `);
 }
