@@ -135,14 +135,26 @@ function executeSettlement(tradingDayId) {
   const contracts = db.prepare('SELECT id, contract_price FROM mid_long_term_contracts').all();
   for (const c of contracts) contractPriceMap[c.id] = c.contract_price;
 
+  const freqExemptionMap = {};
+  const freqExemptRows = db.prepare(`
+    SELECT aa.participant_id, aa.hour, aa.cleared_capacity
+    FROM ancillary_clearing_results cr
+    JOIN ancillary_clearing_allocations aa ON cr.id = aa.clearing_result_id
+    WHERE cr.trading_day_id = ? AND cr.service_type = 'frequency'
+  `).all(tradingDayId);
+  for (const row of freqExemptRows) {
+    if (!freqExemptionMap[row.participant_id]) freqExemptionMap[row.participant_id] = {};
+    freqExemptionMap[row.participant_id][row.hour] = row.cleared_capacity;
+  }
+
   const tx = db.transaction(() => {
     db.prepare('DELETE FROM settlement_details WHERE trading_day_id = ?').run(tradingDayId);
 
     const insertStmt = db.prepare(`
       INSERT INTO settlement_details
       (id, trading_day_id, participant_id, hour, item_type, contract_id,
-       volume, direction, unit_price, amount)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       volume, direction, unit_price, amount, exempt_amount)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const spotAllocMap = {};
@@ -196,7 +208,7 @@ function executeSettlement(tradingDayId) {
           }
           insertStmt.run(
             uuidv4(), tradingDayId, partId, h, 'contract', ci.contract_id,
-            vol, ci.side, contractPrice, amount
+            vol, ci.side, contractPrice, amount, 0
           );
         }
 
@@ -209,7 +221,7 @@ function executeSettlement(tradingDayId) {
           }
           insertStmt.run(
             uuidv4(), tradingDayId, partId, h, 'spot', null,
-            spotVolume, partType === 'generator' ? 'sell' : 'buy', clearingPrice, spotAmount
+            spotVolume, partType === 'generator' ? 'sell' : 'buy', clearingPrice, spotAmount, 0
           );
         }
 
@@ -227,11 +239,18 @@ function executeSettlement(tradingDayId) {
           }
 
           const absDeviation = Math.abs(deviation);
-          const settlementAmount = absDeviation * (settlementPrice - clearingPrice);
+          let exemptAmount = 0;
+
+          if (partType === 'generator' && freqExemptionMap[partId] && freqExemptionMap[partId][h]) {
+            exemptAmount = Math.min(absDeviation, freqExemptionMap[partId][h]);
+          }
+
+          const penalizedDeviation = absDeviation - exemptAmount;
+          const settlementAmount = penalizedDeviation * (settlementPrice - clearingPrice);
 
           insertStmt.run(
             uuidv4(), tradingDayId, partId, h, 'deviation', null,
-            absDeviation, deviationDirection, settlementPrice, settlementAmount
+            absDeviation, deviationDirection, settlementPrice, settlementAmount, exemptAmount
           );
         }
       }
@@ -317,7 +336,8 @@ function _buildSettlementResponse(tradingDayId, rows, td) {
           volume: devItem.volume,
           direction: devItem.direction,
           unit_price: devItem.unit_price,
-          amount: devItem.amount
+          amount: devItem.amount,
+          exempt_amount: devItem.exempt_amount || 0
         } : null
       });
     }
@@ -409,7 +429,7 @@ function getFullParticipantReport(tradingDayId, participantId) {
   );
 
   const settlementRows = db.prepare(`
-    SELECT hour, item_type, contract_id, volume, direction, unit_price, amount
+    SELECT hour, item_type, contract_id, volume, direction, unit_price, amount, exempt_amount
     FROM settlement_details
     WHERE trading_day_id = ? AND participant_id = ?
     ORDER BY hour, item_type
@@ -457,7 +477,8 @@ function getFullParticipantReport(tradingDayId, participantId) {
       volume: s.volume,
       direction: s.direction,
       unit_price: s.unit_price,
-      amount: s.amount
+      amount: s.amount,
+      exempt_amount: s.exempt_amount || 0
     });
   }
 

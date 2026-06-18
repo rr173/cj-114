@@ -6,6 +6,7 @@ const tradingDaysRouter = require('./routes/tradingDays');
 const bidsRouter = require('./routes/bids');
 const settlementRouter = require('./routes/settlement');
 const contractsRouter = require('./routes/contracts');
+const ancillaryServicesRouter = require('./routes/ancillaryServices');
 
 const app = express();
 
@@ -17,6 +18,7 @@ app.use('/api/trading-days', tradingDaysRouter);
 app.use('/api/bids', bidsRouter);
 app.use('/api/settlement', settlementRouter);
 app.use('/api/contracts', contractsRouter);
+app.use('/api/ancillary-services', ancillaryServicesRouter);
 
 app.get('/api/health', (req, res) => {
   res.json({

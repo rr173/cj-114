@@ -148,14 +148,99 @@ function initDatabase() {
       direction TEXT,
       unit_price REAL NOT NULL,
       amount REAL NOT NULL,
+      exempt_amount REAL DEFAULT 0,
       created_at TEXT DEFAULT (datetime('now')),
       FOREIGN KEY (trading_day_id) REFERENCES trading_days(id),
       FOREIGN KEY (participant_id) REFERENCES market_participants(id),
       FOREIGN KEY (contract_id) REFERENCES mid_long_term_contracts(id)
     );
+
+    CREATE TABLE IF NOT EXISTS ancillary_service_registrations (
+      id TEXT PRIMARY KEY,
+      participant_id TEXT NOT NULL,
+      service_type TEXT NOT NULL CHECK(service_type IN ('frequency', 'reserve')),
+      adjustable_capacity REAL,
+      response_rate REAL,
+      reserve_capacity REAL,
+      startup_time REAL,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (participant_id) REFERENCES market_participants(id),
+      UNIQUE(participant_id, service_type)
+    );
+
+    CREATE TABLE IF NOT EXISTS ancillary_service_bids (
+      id TEXT PRIMARY KEY,
+      trading_day_id TEXT NOT NULL,
+      participant_id TEXT NOT NULL,
+      service_type TEXT NOT NULL CHECK(service_type IN ('frequency', 'reserve')),
+      capacity_price REAL NOT NULL,
+      mileage_price REAL,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (trading_day_id) REFERENCES trading_days(id),
+      FOREIGN KEY (participant_id) REFERENCES market_participants(id),
+      UNIQUE(trading_day_id, participant_id, service_type)
+    );
+
+    CREATE TABLE IF NOT EXISTS ancillary_clearing_results (
+      id TEXT PRIMARY KEY,
+      trading_day_id TEXT NOT NULL,
+      service_type TEXT NOT NULL CHECK(service_type IN ('frequency', 'reserve')),
+      clearing_price REAL NOT NULL,
+      mileage_clearing_price REAL,
+      total_cleared_capacity REAL NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (trading_day_id) REFERENCES trading_days(id),
+      UNIQUE(trading_day_id, service_type)
+    );
+
+    CREATE TABLE IF NOT EXISTS ancillary_clearing_allocations (
+      id TEXT PRIMARY KEY,
+      clearing_result_id TEXT NOT NULL,
+      participant_id TEXT NOT NULL,
+      hour INTEGER NOT NULL CHECK(hour BETWEEN 0 AND 23),
+      cleared_capacity REAL NOT NULL,
+      clearing_price REAL NOT NULL,
+      mileage_clearing_price REAL,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (clearing_result_id) REFERENCES ancillary_clearing_results(id),
+      FOREIGN KEY (participant_id) REFERENCES market_participants(id),
+      UNIQUE(clearing_result_id, participant_id, hour)
+    );
+
+    CREATE TABLE IF NOT EXISTS ancillary_mileage_submissions (
+      id TEXT PRIMARY KEY,
+      participant_id TEXT NOT NULL,
+      month TEXT NOT NULL,
+      actual_mileage REAL NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (participant_id) REFERENCES market_participants(id),
+      UNIQUE(participant_id, month)
+    );
+
+    CREATE TABLE IF NOT EXISTS ancillary_service_settlements (
+      id TEXT PRIMARY KEY,
+      participant_id TEXT NOT NULL,
+      month TEXT NOT NULL,
+      service_type TEXT NOT NULL CHECK(service_type IN ('frequency', 'reserve')),
+      winning_hours INTEGER NOT NULL,
+      total_winning_capacity REAL NOT NULL,
+      capacity_clearing_price REAL NOT NULL,
+      capacity_fee REAL NOT NULL,
+      mileage_clearing_price REAL,
+      actual_mileage REAL,
+      mileage_fee REAL,
+      total_fee REAL NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (participant_id) REFERENCES market_participants(id),
+      UNIQUE(participant_id, month, service_type)
+    );
   `);
 }
 
 initDatabase();
+
+try { db.exec(`ALTER TABLE trading_days ADD COLUMN frequency_demand REAL`); } catch (e) {}
+try { db.exec(`ALTER TABLE trading_days ADD COLUMN reserve_demand REAL`); } catch (e) {}
+try { db.exec(`ALTER TABLE settlement_details ADD COLUMN exempt_amount REAL DEFAULT 0`); } catch (e) {}
 
 module.exports = db;

@@ -2,7 +2,7 @@ const { v4: uuidv4 } = require('uuid');
 const db = require('../utils/db');
 
 function createTradingDay(data) {
-  const { trade_date, bid_deadline } = data;
+  const { trade_date, bid_deadline, frequency_demand, reserve_demand } = data;
 
   if (!trade_date || !bid_deadline) {
     throw new Error('交易日和报价截止时间为必填项');
@@ -20,9 +20,9 @@ function createTradingDay(data) {
 
   const id = uuidv4();
   db.prepare(`
-    INSERT INTO trading_days (id, trade_date, bid_deadline, status)
-    VALUES (?, ?, ?, 'bidding')
-  `).run(id, trade_date, bid_deadline);
+    INSERT INTO trading_days (id, trade_date, bid_deadline, status, frequency_demand, reserve_demand)
+    VALUES (?, ?, ?, 'bidding', ?, ?)
+  `).run(id, trade_date, bid_deadline, frequency_demand || null, reserve_demand || null);
 
   return getTradingDayById(id);
 }
