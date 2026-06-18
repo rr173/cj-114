@@ -1,0 +1,28 @@
+{
+  "name": "cj-114",
+  "version": "1.0.0",
+  "description": "",
+  "main": "src/app.js",
+  "scripts": {
+    "start": "node src/app.js",
+    "test": "node test/end-to-end.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rr173/cj-114.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/rr173/cj-114/issues"
+  },
+  "homepage": "https://github.com/rr173/cj-114#readme",
+  "dependencies": {
+    "better-sqlite3": "^12.11.1",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "uuid": "^14.0.0"
+  }
+}

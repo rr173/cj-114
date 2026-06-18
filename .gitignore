@@ -10,3 +10,4 @@ node_modules/
 
 # 提交临时文件
 .commit_msg
+data/
