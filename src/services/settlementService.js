@@ -200,7 +200,7 @@ function executeSettlement(tradingDayId) {
           );
         }
 
-        if (spotVolume > 0 || (spotAlloc && spotAlloc.final_dispatch != null)) {
+        if (spotVolume > 0) {
           let spotAmount;
           if (partType === 'generator') {
             spotAmount = -spotVolume * clearingPrice;

@@ -180,7 +180,7 @@ function decomposeContractsForDate(tradeDate) {
   const tradingDayId = td ? td.id : null;
 
   const contracts = db.prepare(`
-    SELECT * FROM mid_long_term_contracts WHERE status = 'active'
+    SELECT * FROM mid_long_term_contracts
   `).all();
 
   const effectiveContracts = contracts.filter(c => {
