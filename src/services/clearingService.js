@@ -54,50 +54,57 @@ function findClearingPoint(supplyCurve, demandCurve) {
     return { clearingPrice: 0, clearingVolume: 0 };
   }
 
-  let i = 0, j = 0;
+  const totalDemand = demandCurve[demandCurve.length - 1].cumulative_demand;
+  const totalSupply = supplyCurve[supplyCurve.length - 1].cumulative_capacity;
+
+  if (totalSupply === 0 || totalDemand === 0) {
+    return { clearingPrice: 0, clearingVolume: 0 };
+  }
+
   let clearingPrice = 0;
   let clearingVolume = 0;
 
-  while (i < supplyCurve.length && j < demandCurve.length) {
-    const supplyPrice = supplyCurve[i].price;
-    const demandPrice = demandCurve[j].price;
-    const supplyQty = supplyCurve[i].cumulative_capacity;
-    const demandQty = demandCurve[j].cumulative_demand;
+  for (let i = 0; i < supplyCurve.length; i++) {
+    const p = supplyCurve[i].price;
+    const sQty = supplyCurve[i].cumulative_capacity;
 
-    if (supplyPrice <= demandPrice) {
-      clearingPrice = supplyPrice;
-      clearingVolume = Math.min(supplyQty, demandQty);
-      if (supplyQty <= demandQty) {
-        i++;
+    let dQty = 0;
+    for (let j = 0; j < demandCurve.length; j++) {
+      if (demandCurve[j].price >= p) {
+        dQty = demandCurve[j].cumulative_demand;
       } else {
-        j++;
+        break;
       }
-    } else {
+    }
+
+    if (sQty >= dQty && dQty > 0) {
+      clearingPrice = p;
+      clearingVolume = dQty;
       break;
     }
+
+    clearingVolume = sQty;
+    clearingPrice = p;
   }
 
   if (clearingVolume === 0) {
     return { clearingPrice: 0, clearingVolume: 0 };
   }
 
-  if (i < supplyCurve.length && j > 0) {
-    const lastDemand = demandCurve[j - 1];
-    const prevSupply = i > 0 ? supplyCurve[i - 1] : null;
-    if (prevSupply && lastDemand.cumulative_demand < supplyCurve[i].cumulative_capacity) {
-      clearingPrice = lastDemand.price;
-      clearingVolume = lastDemand.cumulative_demand;
+  if (totalSupply < totalDemand) {
+    const lastSupplyPrice = supplyCurve[supplyCurve.length - 1].price;
+    let dAtLastSupply = 0;
+    for (let j = 0; j < demandCurve.length; j++) {
+      if (demandCurve[j].price >= lastSupplyPrice) {
+        dAtLastSupply = demandCurve[j].cumulative_demand;
+      } else {
+        break;
+      }
     }
-  }
-
-  if (i >= supplyCurve.length && j < demandCurve.length && demandCurve[j].price >= supplyCurve[i - 1].price) {
-    clearingPrice = supplyCurve[i - 1].price;
-    clearingVolume = supplyCurve[i - 1].cumulative_capacity;
-  }
-
-  if (j >= demandCurve.length && i < supplyCurve.length && supplyCurve[i].price <= demandCurve[j - 1].price) {
-    clearingPrice = demandCurve[j - 1].price;
-    clearingVolume = demandCurve[j - 1].cumulative_demand;
+    if (dAtLastSupply > totalSupply) {
+      clearingPrice = lastSupplyPrice;
+      clearingVolume = totalSupply;
+    }
   }
 
   return { clearingPrice, clearingVolume };
@@ -166,21 +173,27 @@ function performUnitCommitment(initialAllocations, tradingDayId) {
     }
 
     for (let h = 1; h < 24; h++) {
-      const diff = adjusted[h] - adjusted[h - 1];
-      if (diff > gen.ramp_rate) {
+      if (adjusted[h] > adjusted[h - 1] + gen.ramp_rate) {
         adjusted[h] = adjusted[h - 1] + gen.ramp_rate;
         adjustmentReasons[`${pid}_${h}`] = (adjustmentReasons[`${pid}_${h}`] || '') +
-          `[爬坡上调限制]`;
-      } else if (diff < -gen.ramp_rate) {
-        adjusted[h] = adjusted[h - 1] - gen.ramp_rate;
-        adjustmentReasons[`${pid}_${h}`] = (adjustmentReasons[`${pid}_${h}`] || '') +
-          `[爬坡下调限制]`;
+          `[爬坡上调限制: 截断高时段]`;
+      }
+    }
+
+    for (let h = 23; h >= 1; h--) {
+      if (adjusted[h - 1] > adjusted[h] + gen.ramp_rate) {
+        adjusted[h - 1] = adjusted[h] + gen.ramp_rate;
+        adjustmentReasons[`${pid}_${h - 1}`] = (adjustmentReasons[`${pid}_${h - 1}`] || '') +
+          `[爬坡下调限制: 截断高时段]`;
       }
     }
 
     for (let h = 0; h < 24; h++) {
       adjusted[h] = Math.min(adjusted[h], gen.installed_capacity);
       if (adjusted[h] < 0) adjusted[h] = 0;
+      if (adjusted[h] > 0 && adjusted[h] < gen.min_output) {
+        adjusted[h] = gen.min_output;
+      }
       if (!finalAllocations[h]) finalAllocations[h] = {};
       finalAllocations[h][pid] = {
         initial: schedule[h],
