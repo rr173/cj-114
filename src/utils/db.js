@@ -155,6 +155,46 @@ function initDatabase() {
       FOREIGN KEY (contract_id) REFERENCES mid_long_term_contracts(id)
     );
 
+    CREATE TABLE IF NOT EXISTS supervision_anomalies (
+      id TEXT PRIMARY KEY,
+      trading_day_id TEXT NOT NULL,
+      trade_date TEXT NOT NULL,
+      hour INTEGER NOT NULL CHECK(hour BETWEEN 0 AND 23),
+      participant_id TEXT,
+      anomaly_type TEXT NOT NULL CHECK(anomaly_type IN ('price_inflation', 'volume_price_manipulation', 'collusion_suspected')),
+      metric_values TEXT NOT NULL,
+      basis TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (trading_day_id) REFERENCES trading_days(id),
+      FOREIGN KEY (participant_id) REFERENCES market_participants(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS supervision_hhi_records (
+      id TEXT PRIMARY KEY,
+      trading_day_id TEXT NOT NULL,
+      trade_date TEXT NOT NULL,
+      hour INTEGER NOT NULL CHECK(hour BETWEEN 0 AND 23),
+      hhi_value REAL NOT NULL,
+      concentration_level TEXT NOT NULL CHECK(concentration_level IN ('low', 'moderate', 'high')),
+      share_details TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (trading_day_id) REFERENCES trading_days(id),
+      UNIQUE(trading_day_id, hour)
+    );
+
+    CREATE TABLE IF NOT EXISTS supervision_alerts (
+      id TEXT PRIMARY KEY,
+      trading_day_id TEXT NOT NULL,
+      trade_date TEXT NOT NULL,
+      hour INTEGER,
+      alert_type TEXT NOT NULL CHECK(alert_type IN ('price_spike', 'price_drop', 'daily_price_anomaly', 'market_dominance')),
+      participant_id TEXT,
+      metric_values TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (trading_day_id) REFERENCES trading_days(id),
+      FOREIGN KEY (participant_id) REFERENCES market_participants(id)
+    );
+
     CREATE TABLE IF NOT EXISTS ancillary_service_registrations (
       id TEXT PRIMARY KEY,
       participant_id TEXT NOT NULL,

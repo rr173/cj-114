@@ -3,6 +3,7 @@ const db = require('../utils/db');
 const { getTradingDayById } = require('./tradingDayService');
 const { listParticipants, getParticipantById } = require('./participantService');
 const { getAllGeneratorBidsByHour, getAllConsumerBidsByHour } = require('./biddingService');
+const supervisionService = require('./supervisionService');
 
 function buildSupplyCurve(bids) {
   const segments = [];
@@ -309,6 +310,12 @@ function executeClearing(tradingDayId) {
   });
 
   tx();
+
+  try {
+    supervisionService.runFullAnalysis(tradingDayId);
+  } catch (e) {
+    console.error('[Supervision] 监管分析异常:', e.message);
+  }
 
   return getClearingSummary(tradingDayId);
 }

@@ -7,6 +7,7 @@ const bidsRouter = require('./routes/bids');
 const settlementRouter = require('./routes/settlement');
 const contractsRouter = require('./routes/contracts');
 const ancillaryServicesRouter = require('./routes/ancillaryServices');
+const supervisionRouter = require('./routes/supervision');
 
 const app = express();
 
@@ -19,6 +20,7 @@ app.use('/api/bids', bidsRouter);
 app.use('/api/settlement', settlementRouter);
 app.use('/api/contracts', contractsRouter);
 app.use('/api/ancillary-services', ancillaryServicesRouter);
+app.use('/api/supervision', supervisionRouter);
 
 app.get('/api/health', (req, res) => {
   res.json({
