@@ -4,6 +4,7 @@ const { getTradingDayById, getTradingDayByDate } = require('./tradingDayService'
 const { listParticipants, getParticipantById } = require('./participantService');
 const { decomposeContractsForDate, getDecompositionByDate } = require('./contractService');
 const { getParticipantZone, listPriceZones } = require('./priceZoneService');
+const { getIntradayNetVolumes } = require('./intradayService');
 
 const POSITIVE_DEVIATION_RATIO = 0.8;
 const NEGATIVE_DEVIATION_RATIO = 1.2;
@@ -179,6 +180,16 @@ function executeSettlement(tradingDayId) {
     freqExemptionMap[row.participant_id][row.hour] = row.cleared_capacity;
   }
 
+  const intradayNetVolumes = getIntradayNetVolumes(tradingDayId);
+
+  const allPartIds = new Set();
+  for (const a of allocations) allPartIds.add(a.participant_id);
+  for (const d of decomposition) {
+    allPartIds.add(d.buyer_id);
+    allPartIds.add(d.seller_id);
+  }
+  for (const pid of Object.keys(intradayNetVolumes)) allPartIds.add(pid);
+
   const tx = db.transaction(() => {
     db.prepare('DELETE FROM settlement_details WHERE trading_day_id = ?').run(tradingDayId);
 
@@ -193,13 +204,6 @@ function executeSettlement(tradingDayId) {
     for (const alloc of allocations) {
       if (!spotAllocMap[alloc.participant_id]) spotAllocMap[alloc.participant_id] = {};
       spotAllocMap[alloc.participant_id][alloc.hour] = alloc;
-    }
-
-    const allPartIds = new Set();
-    for (const a of allocations) allPartIds.add(a.participant_id);
-    for (const d of decomposition) {
-      allPartIds.add(d.buyer_id);
-      allPartIds.add(d.seller_id);
     }
 
     for (const partId of allPartIds) {
@@ -227,8 +231,13 @@ function executeSettlement(tradingDayId) {
           totalContractVolume += ci.decomposed_energy;
         }
 
+        const intradayHourData = intradayNetVolumes[partId]?.[h];
+        const intradayNetVolume = intradayHourData
+          ? intradayHourData.buy_qty - intradayHourData.sell_qty
+          : 0;
+
         const actualVolume = actualMap[partId]?.[h] || 0;
-        const totalObligation = spotVolume + totalContractVolume;
+        const totalObligation = spotVolume + totalContractVolume + intradayNetVolume;
 
         let deviation;
         if (partType === 'generator') {
@@ -264,6 +273,24 @@ function executeSettlement(tradingDayId) {
             uuidv4(), tradingDayId, partId, h, 'spot', null,
             spotVolume, partType === 'generator' ? 'sell' : 'buy', clearingPrice, spotAmount, 0
           );
+        }
+
+        if (intradayHourData) {
+          const netBuyQty = intradayHourData.buy_qty;
+          const netSellQty = intradayHourData.sell_qty;
+          const netPosition = netBuyQty - netSellQty;
+
+          if (Math.abs(netPosition) > 0.0001) {
+            const direction = netPosition > 0 ? 'buy' : 'sell';
+            const volume = Math.abs(netPosition);
+            const netAmount = intradayHourData.buy_amount - intradayHourData.sell_amount;
+            const unitPrice = volume > 0 ? Math.abs(netAmount) / volume : 0;
+
+            insertStmt.run(
+              uuidv4(), tradingDayId, partId, h, 'intraday', null,
+              volume, direction, unitPrice, netAmount, 0
+            );
+          }
         }
 
         const EPSILON = 0.0001;
@@ -376,6 +403,7 @@ function _buildSettlementResponse(tradingDayId, rows, td) {
   let totalSpotAmount = 0;
   let totalDeviationAmount = 0;
   let totalCongestionSurplus = 0;
+  let totalIntradayAmount = 0;
 
   for (const row of rows) {
     if (!byParticipant[row.participant_id]) {
@@ -388,10 +416,12 @@ function _buildSettlementResponse(tradingDayId, rows, td) {
         total_contract_volume: 0,
         total_actual: 0,
         total_deviation: 0,
+        total_intraday_volume: 0,
         total_contract_amount: 0,
         total_spot_amount: 0,
         total_deviation_amount: 0,
         total_congestion_surplus: 0,
+        total_intraday_amount: 0,
         total_settlement_amount: 0,
         hourly: []
       };
@@ -401,6 +431,7 @@ function _buildSettlementResponse(tradingDayId, rows, td) {
     if (row.item_type === 'spot') p.total_spot_volume += row.volume;
     if (row.item_type === 'contract') p.total_contract_volume += row.volume;
     if (row.item_type === 'deviation') p.total_deviation += row.volume;
+    if (row.item_type === 'intraday') p.total_intraday_volume += row.volume;
 
     if (row.item_type === 'contract') {
       p.total_contract_amount += row.amount;
@@ -414,6 +445,9 @@ function _buildSettlementResponse(tradingDayId, rows, td) {
     } else if (row.item_type === 'congestion_surplus') {
       p.total_congestion_surplus += row.amount;
       totalCongestionSurplus += row.amount;
+    } else if (row.item_type === 'intraday') {
+      p.total_intraday_amount += row.amount;
+      totalIntradayAmount += row.amount;
     }
     p.total_settlement_amount += row.amount;
     totalAmount += row.amount;
@@ -433,6 +467,7 @@ function _buildSettlementResponse(tradingDayId, rows, td) {
       const spotItem = hourRows.find(r => r.item_type === 'spot');
       const devItem = hourRows.find(r => r.item_type === 'deviation');
       const congestionItem = hourRows.find(r => r.item_type === 'congestion_surplus');
+      const intradayItem = hourRows.find(r => r.item_type === 'intraday');
 
       p.hourly.push({
         hour: h,
@@ -454,6 +489,12 @@ function _buildSettlementResponse(tradingDayId, rows, td) {
           volume: congestionItem.volume,
           direction: congestionItem.direction,
           amount: congestionItem.amount
+        } : null,
+        intraday: intradayItem ? {
+          volume: intradayItem.volume,
+          direction: intradayItem.direction,
+          unit_price: intradayItem.unit_price,
+          amount: intradayItem.amount
         } : null
       });
     }
@@ -474,6 +515,7 @@ function _buildSettlementResponse(tradingDayId, rows, td) {
       total_spot_amount: totalSpotAmount,
       total_deviation_amount: totalDeviationAmount,
       total_congestion_surplus: totalCongestionSurplus,
+      total_intraday_amount: totalIntradayAmount,
       total_settlement_amount: totalAmount
     },
     participants: Object.values(byParticipant)
@@ -601,7 +643,8 @@ function getFullParticipantReport(tradingDayId, participantId) {
 
   const hourly = [];
   let totalSpot = 0, totalActual = 0, totalContract = 0;
-  let totalContractAmt = 0, totalSpotAmt = 0, totalDevAmt = 0, totalCongestionAmt = 0;
+  let totalContractAmt = 0, totalSpotAmt = 0, totalDevAmt = 0, totalCongestionAmt = 0, totalIntradayAmt = 0;
+  let totalIntradayVol = 0;
   for (let h = 0; h < 24; h++) {
     const item = hourlyMap[h];
     hourly.push(item);
@@ -614,6 +657,7 @@ function getFullParticipantReport(tradingDayId, participantId) {
         else if (si.item_type === 'spot') totalSpotAmt += si.amount;
         else if (si.item_type === 'deviation') totalDevAmt += si.amount;
         else if (si.item_type === 'congestion_surplus') totalCongestionAmt += si.amount;
+        else if (si.item_type === 'intraday') { totalIntradayAmt += si.amount; totalIntradayVol += si.volume; }
       }
     }
   }
@@ -625,13 +669,15 @@ function getFullParticipantReport(tradingDayId, participantId) {
     summary: {
       total_spot_volume: totalSpot,
       total_contract_volume: totalContract,
-      total_obligation: totalSpot + totalContract,
+      total_intraday_volume: totalIntradayVol,
+      total_obligation: totalSpot + totalContract + totalIntradayVol,
       total_actual_volume: totalActual,
       total_contract_settlement: totalContractAmt,
       total_spot_settlement: totalSpotAmt,
+      total_intraday_settlement: totalIntradayAmt,
       total_deviation_settlement: totalDevAmt,
       total_congestion_surplus: totalCongestionAmt,
-      total_settlement_amount: totalContractAmt + totalSpotAmt + totalDevAmt + totalCongestionAmt
+      total_settlement_amount: totalContractAmt + totalSpotAmt + totalIntradayAmt + totalDevAmt + totalCongestionAmt
     },
     hourly
   };

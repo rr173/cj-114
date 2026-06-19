@@ -10,6 +10,7 @@ const ancillaryServicesRouter = require('./routes/ancillaryServices');
 const supervisionRouter = require('./routes/supervision');
 const priceZonesRouter = require('./routes/priceZones');
 const tieLinesRouter = require('./routes/tieLines');
+const intradayRouter = require('./routes/intraday');
 
 const app = express();
 
@@ -25,6 +26,7 @@ app.use('/api/ancillary-services', ancillaryServicesRouter);
 app.use('/api/supervision', supervisionRouter);
 app.use('/api/price-zones', priceZonesRouter);
 app.use('/api/tie-lines', tieLinesRouter);
+app.use('/api/intraday', intradayRouter);
 
 app.get('/api/health', (req, res) => {
   res.json({

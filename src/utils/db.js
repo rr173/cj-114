@@ -346,6 +346,40 @@ function initDatabase() {
       FOREIGN KEY (tie_line_id) REFERENCES tie_lines(id),
       UNIQUE(trading_day_id, hour, tie_line_id)
     );
+
+    CREATE TABLE IF NOT EXISTS intraday_orders (
+      id TEXT PRIMARY KEY,
+      trading_day_id TEXT NOT NULL,
+      participant_id TEXT NOT NULL,
+      hour INTEGER NOT NULL CHECK(hour BETWEEN 0 AND 23),
+      order_type TEXT NOT NULL CHECK(order_type IN ('increase_gen', 'decrease_gen', 'increase_con', 'decrease_con')),
+      side TEXT NOT NULL CHECK(side IN ('buy', 'sell')),
+      quantity REAL NOT NULL,
+      price REAL NOT NULL,
+      remaining_quantity REAL NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'partial', 'filled', 'cancelled')),
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (trading_day_id) REFERENCES trading_days(id),
+      FOREIGN KEY (participant_id) REFERENCES market_participants(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS intraday_trades (
+      id TEXT PRIMARY KEY,
+      trading_day_id TEXT NOT NULL,
+      hour INTEGER NOT NULL CHECK(hour BETWEEN 0 AND 23),
+      buy_order_id TEXT NOT NULL,
+      sell_order_id TEXT NOT NULL,
+      buy_participant_id TEXT NOT NULL,
+      sell_participant_id TEXT NOT NULL,
+      trade_quantity REAL NOT NULL,
+      trade_price REAL NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (trading_day_id) REFERENCES trading_days(id),
+      FOREIGN KEY (buy_order_id) REFERENCES intraday_orders(id),
+      FOREIGN KEY (sell_order_id) REFERENCES intraday_orders(id),
+      FOREIGN KEY (buy_participant_id) REFERENCES market_participants(id),
+      FOREIGN KEY (sell_participant_id) REFERENCES market_participants(id)
+    );
   `);
 }
 
@@ -355,5 +389,33 @@ try { db.exec(`ALTER TABLE trading_days ADD COLUMN frequency_demand REAL`); } ca
 try { db.exec(`ALTER TABLE trading_days ADD COLUMN reserve_demand REAL`); } catch (e) {}
 try { db.exec(`ALTER TABLE settlement_details ADD COLUMN exempt_amount REAL DEFAULT 0`); } catch (e) {}
 try { db.exec(`ALTER TABLE clearing_results ADD COLUMN clearing_type TEXT DEFAULT 'unified' CHECK(clearing_type IN ('unified', 'zoned'))`); } catch (e) {}
+
+try {
+  const migrateSettlement = db.transaction(() => {
+    db.exec(`
+      CREATE TABLE settlement_details_new (
+        id TEXT PRIMARY KEY,
+        trading_day_id TEXT NOT NULL,
+        participant_id TEXT NOT NULL,
+        hour INTEGER NOT NULL CHECK(hour BETWEEN 0 AND 23),
+        item_type TEXT NOT NULL CHECK(item_type IN ('contract', 'spot', 'deviation', 'congestion_surplus', 'intraday')),
+        contract_id TEXT,
+        volume REAL NOT NULL,
+        direction TEXT,
+        unit_price REAL NOT NULL,
+        amount REAL NOT NULL,
+        exempt_amount REAL DEFAULT 0,
+        created_at TEXT DEFAULT (datetime('now')),
+        FOREIGN KEY (trading_day_id) REFERENCES trading_days(id),
+        FOREIGN KEY (participant_id) REFERENCES market_participants(id),
+        FOREIGN KEY (contract_id) REFERENCES mid_long_term_contracts(id)
+      )
+    `);
+    db.exec('INSERT INTO settlement_details_new SELECT * FROM settlement_details');
+    db.exec('DROP TABLE settlement_details');
+    db.exec('ALTER TABLE settlement_details_new RENAME TO settlement_details');
+  });
+  migrateSettlement();
+} catch (e) {}
 
 module.exports = db;
