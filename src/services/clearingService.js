@@ -99,19 +99,16 @@ function findClearingPoint(supplyCurve, demandCurve) {
   }
 
   if (totalSupply < totalDemand) {
-    const lastSupplyPrice = supplyCurve[supplyCurve.length - 1].price;
-    let dAtLastSupply = 0;
+    let demandMarginalPrice = 0;
     for (let j = 0; j < demandCurve.length; j++) {
-      if (demandCurve[j].price >= lastSupplyPrice) {
-        dAtLastSupply = demandCurve[j].cumulative_demand;
-      } else {
+      if (demandCurve[j].cumulative_demand >= totalSupply) {
+        demandMarginalPrice = demandCurve[j].price;
         break;
       }
+      demandMarginalPrice = demandCurve[j].price;
     }
-    if (dAtLastSupply > totalSupply) {
-      clearingPrice = lastSupplyPrice;
-      clearingVolume = totalSupply;
-    }
+    clearingPrice = Math.max(clearingPrice, demandMarginalPrice);
+    clearingVolume = totalSupply;
   }
 
   return { clearingPrice, clearingVolume };
@@ -265,6 +262,25 @@ function performZonalClearing(genBids, conBids, zones, tieLines) {
   const zoneMap = {};
   for (const z of zones) zoneMap[z.id] = z;
 
+  const allBidParticipants = new Set([
+    ...genBids.map(b => b.participant_id),
+    ...conBids.map(b => b.participant_id)
+  ]);
+
+  const unassignedParticipants = [];
+  for (const pid of allBidParticipants) {
+    const zone = getParticipantZone(pid);
+    if (!zone) {
+      unassignedParticipants.push(pid);
+    }
+  }
+
+  if (unassignedParticipants.length > 0) {
+    throw new Error(
+      `以下市场主体未分配到任何电价区，无法进行分区出清: ${unassignedParticipants.join(', ')}`
+    );
+  }
+
   const tieLine = tieLines[0];
   const fromZone = zoneMap[tieLine.from_zone_id];
   const toZone = zoneMap[tieLine.to_zone_id];
@@ -331,17 +347,37 @@ function performZonalClearing(genBids, conBids, zones, tieLines) {
   ];
   const exportDemandCurve = buildDemandCurve(exportDemandWithVirtual);
   const exportResult = findClearingPoint(exportSupplyCurve, exportDemandCurve);
+  const exportPrice = exportResult.clearingPrice;
 
+  const virtualTieGenPrice = exportPrice > 0 ? exportPrice : unifiedPrice;
   const importSupplyWithVirtual = [
     ...importGenBids,
-    { participant_id: 'virtual_tie_gen', price: 0, capacity: maxCapacity, installed_capacity: maxCapacity }
+    { participant_id: 'virtual_tie_gen', price: virtualTieGenPrice, capacity: maxCapacity, installed_capacity: maxCapacity }
   ];
   const importSupplyCurve = buildSupplyCurve(importSupplyWithVirtual);
   const importDemandCurve = buildDemandCurve(importConBids);
   const importResult = findClearingPoint(importSupplyCurve, importDemandCurve);
 
-  const exportPrice = exportResult.clearingPrice;
-  const importPrice = importResult.clearingPrice;
+  let importPrice = importResult.clearingPrice;
+  if (importGenBids.length === 0 && importPrice <= 0) {
+    const sortedImportDemand = [...importConBids].sort((a, b) => b.max_price - a.max_price);
+    let cumDemand = 0;
+    for (const bid of sortedImportDemand) {
+      cumDemand += bid.demand;
+      if (cumDemand >= maxCapacity) {
+        importPrice = bid.max_price;
+        break;
+      }
+    }
+    if (importPrice <= 0 && sortedImportDemand.length > 0) {
+      importPrice = sortedImportDemand[sortedImportDemand.length - 1].max_price;
+    }
+    if (importPrice <= 0) {
+      importPrice = virtualTieGenPrice;
+    }
+  }
+
+  const importPriceFinal = importPrice;
 
   const exportGenAllocs = calculateGeneratorAllocations(
     exportSupplyCurve, exportPrice, exportResult.clearingVolume
@@ -357,7 +393,7 @@ function performZonalClearing(genBids, conBids, zones, tieLines) {
   }
 
   const importGenAllocsRaw = calculateGeneratorAllocations(
-    importSupplyCurve, importPrice, importResult.clearingVolume
+    importSupplyCurve, importPriceFinal, importResult.clearingVolume
   );
   const importGenAllocs = {};
   for (const [pid, vol] of Object.entries(importGenAllocsRaw)) {
@@ -366,7 +402,7 @@ function performZonalClearing(genBids, conBids, zones, tieLines) {
     }
   }
   const importConAllocs = calculateConsumerAllocations(
-    importDemandCurve, importPrice, importResult.clearingVolume
+    importDemandCurve, importPriceFinal, importResult.clearingVolume
   );
 
   const totalGenAllocs = { ...exportGenAllocs, ...importGenAllocs };
@@ -386,7 +422,7 @@ function performZonalClearing(genBids, conBids, zones, tieLines) {
   };
   zoneResults[importZoneId] = {
     zoneId: importZoneId,
-    clearingPrice: importPrice,
+    clearingPrice: importPriceFinal,
     clearingVolume: importResult.clearingVolume,
     netExport: -maxCapacity,
     genAllocs: importGenAllocs,
@@ -405,7 +441,7 @@ function performZonalClearing(genBids, conBids, zones, tieLines) {
     exportZoneId,
     importZoneId,
     exportPrice,
-    importPrice,
+    importPrice: importPriceFinal,
     tieLineId: tieLine.id,
     genAllocs: totalGenAllocs,
     conAllocs: totalConAllocs
