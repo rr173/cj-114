@@ -4,11 +4,30 @@ const { getTradingDayById } = require('./tradingDayService');
 const { getParticipantById } = require('./participantService');
 const { getDecompositionByDate } = require('./contractService');
 
-function isTradingWindowOpen(tradingDayId, hour, currentTime) {
+function getTradingWindowInfo(tradingDayId, hour, currentTime) {
   const td = getTradingDayById(tradingDayId);
   if (!td) throw new Error('交易日不存在');
-  if (td.status === 'bidding') return false;
-  if (td.status === 'settled') return false;
+
+  if (td.status === 'bidding') {
+    return {
+      is_open: false,
+      reason: 'trading_day_not_cleared',
+      message: `该交易日当前状态为"bidding"，尚未执行日前出清，日内交易窗口未开启`,
+      open_time: null,
+      close_time: null,
+      current_time: (currentTime ? new Date(currentTime) : new Date()).toISOString()
+    };
+  }
+  if (td.status === 'settled') {
+    return {
+      is_open: false,
+      reason: 'trading_day_settled',
+      message: `该交易日当前状态为"settled"，已完成结算，日内交易窗口已关闭`,
+      open_time: null,
+      close_time: null,
+      current_time: (currentTime ? new Date(currentTime) : new Date()).toISOString()
+    };
+  }
 
   const now = currentTime ? new Date(currentTime) : new Date();
   const tradeDate = td.trade_date;
@@ -38,7 +57,32 @@ function isTradingWindowOpen(tradingDayId, hour, currentTime) {
     closeHour, closeMinute, 0
   );
 
-  return now >= openTime && now < closeTime;
+  const isOpen = now >= openTime && now < closeTime;
+  let reason = 'in_window';
+  let message = `时段${hour}的日内交易窗口已开放`;
+  if (!isOpen) {
+    if (now < openTime) {
+      reason = 'before_window';
+      message = `时段${hour}的日内交易窗口尚未开放，开放时间为${openTime.toLocaleString('zh-CN')}（该时段前2小时），当前时间${now.toLocaleString('zh-CN')}`;
+    } else {
+      reason = 'after_window';
+      message = `时段${hour}的日内交易窗口已关闭，关闭时间为${closeTime.toLocaleString('zh-CN')}（该时段前30分钟），当前时间${now.toLocaleString('zh-CN')}`;
+    }
+  }
+
+  return {
+    is_open: isOpen,
+    reason,
+    message,
+    open_time: openTime.toISOString(),
+    close_time: closeTime.toISOString(),
+    current_time: now.toISOString()
+  };
+}
+
+function isTradingWindowOpen(tradingDayId, hour, currentTime) {
+  const info = getTradingWindowInfo(tradingDayId, hour, currentTime);
+  return info.is_open;
 }
 
 function getDayAheadClearedVolume(tradingDayId, participantId, hour) {
@@ -140,8 +184,11 @@ function submitOrder(tradingDayId, participantId, data, options = {}) {
   const validOrderTypes = ['increase_gen', 'decrease_gen', 'increase_con', 'decrease_con'];
   if (!validOrderTypes.includes(order_type)) throw new Error('挂单类型无效，必须是 increase_gen/decrease_gen/increase_con/decrease_con');
 
-  if (!options.skipWindowCheck && !isTradingWindowOpen(tradingDayId, hour, options.currentTime)) {
-    throw new Error(`时段 ${hour} 的日内交易窗口未开放(开放时间为该时段前2小时至前30分钟)`);
+  if (!options.skipWindowCheck) {
+    const winInfo = getTradingWindowInfo(tradingDayId, hour, options.currentTime);
+    if (!winInfo.is_open) {
+      throw new Error(`时段 ${hour} 的日内交易窗口未开放：${winInfo.message}`);
+    }
   }
 
   validateOrder(tradingDayId, participantId, hour, order_type, quantity);
@@ -182,8 +229,11 @@ function executeMatching(tradingDayId, hour, options = {}) {
   if (td.status === 'bidding') throw new Error('该交易日尚未出清');
   if (td.status === 'settled') throw new Error('该交易日已完成结算');
 
-  if (!options.skipWindowCheck && !isTradingWindowOpen(tradingDayId, hour, options.currentTime)) {
-    throw new Error(`时段 ${hour} 的日内交易窗口未开放，无法执行撮合`);
+  if (!options.skipWindowCheck) {
+    const winInfo = getTradingWindowInfo(tradingDayId, hour, options.currentTime);
+    if (!winInfo.is_open) {
+      throw new Error(`时段 ${hour} 的日内交易窗口未开放，无法执行撮合：${winInfo.message}`);
+    }
   }
 
   const buyOrders = db.prepare(`
@@ -410,6 +460,7 @@ function getIntradayNetVolumes(tradingDayId) {
 }
 
 module.exports = {
+  getTradingWindowInfo,
   isTradingWindowOpen,
   submitOrder,
   getOrderById,

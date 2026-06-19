@@ -232,9 +232,14 @@ function executeSettlement(tradingDayId) {
         }
 
         const intradayHourData = intradayNetVolumes[partId]?.[h];
-        const intradayNetVolume = intradayHourData
-          ? intradayHourData.buy_qty - intradayHourData.sell_qty
-          : 0;
+        let intradayNetVolume = 0;
+        if (intradayHourData) {
+          if (partType === 'generator') {
+            intradayNetVolume = intradayHourData.sell_qty - intradayHourData.buy_qty;
+          } else {
+            intradayNetVolume = intradayHourData.buy_qty - intradayHourData.sell_qty;
+          }
+        }
 
         const actualVolume = actualMap[partId]?.[h] || 0;
         const totalObligation = spotVolume + totalContractVolume + intradayNetVolume;
@@ -645,6 +650,7 @@ function getFullParticipantReport(tradingDayId, participantId) {
   let totalSpot = 0, totalActual = 0, totalContract = 0;
   let totalContractAmt = 0, totalSpotAmt = 0, totalDevAmt = 0, totalCongestionAmt = 0, totalIntradayAmt = 0;
   let totalIntradayVol = 0;
+  let intradayObligationDelta = 0;
   for (let h = 0; h < 24; h++) {
     const item = hourlyMap[h];
     hourly.push(item);
@@ -657,7 +663,15 @@ function getFullParticipantReport(tradingDayId, participantId) {
         else if (si.item_type === 'spot') totalSpotAmt += si.amount;
         else if (si.item_type === 'deviation') totalDevAmt += si.amount;
         else if (si.item_type === 'congestion_surplus') totalCongestionAmt += si.amount;
-        else if (si.item_type === 'intraday') { totalIntradayAmt += si.amount; totalIntradayVol += si.volume; }
+        else if (si.item_type === 'intraday') {
+          totalIntradayAmt += si.amount;
+          totalIntradayVol += si.volume;
+          if (p.type === 'generator') {
+            intradayObligationDelta += (si.direction === 'sell') ? si.volume : -si.volume;
+          } else {
+            intradayObligationDelta += (si.direction === 'buy') ? si.volume : -si.volume;
+          }
+        }
       }
     }
   }
@@ -670,7 +684,7 @@ function getFullParticipantReport(tradingDayId, participantId) {
       total_spot_volume: totalSpot,
       total_contract_volume: totalContract,
       total_intraday_volume: totalIntradayVol,
-      total_obligation: totalSpot + totalContract + totalIntradayVol,
+      total_obligation: totalSpot + totalContract + intradayObligationDelta,
       total_actual_volume: totalActual,
       total_contract_settlement: totalContractAmt,
       total_spot_settlement: totalSpotAmt,
