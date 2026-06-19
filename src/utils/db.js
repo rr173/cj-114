@@ -392,7 +392,7 @@ function initDatabase() {
       quantity REAL NOT NULL,
       owner_id TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'available' CHECK(status IN ('available', 'transferred', 'traded', 'used')),
-      source TEXT NOT NULL CHECK(source IN ('auto_issue', 'market_trade')),
+      source TEXT NOT NULL CHECK(source IN ('auto_issue', 'auto_allocation', 'market_trade')),
       created_at TEXT DEFAULT (datetime('now')),
       FOREIGN KEY (generator_id) REFERENCES market_participants(id),
       FOREIGN KEY (owner_id) REFERENCES market_participants(id),
@@ -502,7 +502,44 @@ try { db.exec(`ALTER TABLE trading_days ADD COLUMN frequency_demand REAL`); } ca
 try { db.exec(`ALTER TABLE trading_days ADD COLUMN reserve_demand REAL`); } catch (e) {}
 try { db.exec(`ALTER TABLE settlement_details ADD COLUMN exempt_amount REAL DEFAULT 0`); } catch (e) {}
 try { db.exec(`ALTER TABLE clearing_results ADD COLUMN clearing_type TEXT DEFAULT 'unified' CHECK(clearing_type IN ('unified', 'zoned'))`); } catch (e) {}
-try { db.exec(`ALTER TABLE market_participants ADD COLUMN energy_type TEXT CHECK(energy_type IN ('wind', 'solar', 'hydro', 'biomass', 'geothermal', 'thermal', 'nuclear', 'other'))`); } catch (e) {}
+try { db.exec(`ALTER TABLE market_participants ADD COLUMN energy_type TEXT`); } catch (e) {}
+
+try {
+  const migrateGcSource = db.transaction(() => {
+    const existing = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='green_certificates'`).get();
+    if (!existing) return;
+
+    const check = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='green_certificates'`).get();
+    if (check.sql.includes("'auto_allocation'")) return;
+
+    db.exec(`
+      CREATE TABLE green_certificates_new (
+        id TEXT PRIMARY KEY,
+        certificate_no TEXT UNIQUE NOT NULL,
+        generator_id TEXT NOT NULL,
+        energy_type TEXT NOT NULL CHECK(energy_type IN ('wind', 'solar', 'hydro', 'biomass', 'geothermal')),
+        trading_day_id TEXT NOT NULL,
+        trade_date TEXT NOT NULL,
+        hour INTEGER NOT NULL CHECK(hour BETWEEN 0 AND 23),
+        quantity REAL NOT NULL,
+        owner_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'available' CHECK(status IN ('available', 'transferred', 'traded', 'used')),
+        source TEXT NOT NULL CHECK(source IN ('auto_issue', 'auto_allocation', 'market_trade')),
+        created_at TEXT DEFAULT (datetime('now')),
+        FOREIGN KEY (generator_id) REFERENCES market_participants(id),
+        FOREIGN KEY (owner_id) REFERENCES market_participants(id),
+        FOREIGN KEY (trading_day_id) REFERENCES trading_days(id)
+      )
+    `);
+    db.exec('INSERT INTO green_certificates_new SELECT * FROM green_certificates');
+    db.exec('DROP TABLE green_certificates');
+    db.exec('ALTER TABLE green_certificates_new RENAME TO green_certificates');
+    console.log('[DB Migration] green_certificates 表 source 字段 CHECK 约束已更新');
+  });
+  migrateGcSource();
+} catch (e) {
+  console.log('[DB Migration] green_certificates 表迁移跳过或失败:', e.message);
+}
 
 try {
   const migrateSettlement = db.transaction(() => {

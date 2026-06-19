@@ -37,6 +37,18 @@ function issueGreenCertificatesForClearing(tradingDayId) {
     ORDER BY cr.hour, p.code
   `).all(tradingDayId);
 
+  console.log(`[GC-Issue] 交易日 ${td.trade_date} 出清记录共 ${clearingData.length} 条`);
+
+  const renewableCount = clearingData.filter(r => r.energy_type && RENEWABLE_ENERGY_TYPES.includes(r.energy_type)).length;
+  const nullEnergyTypeCount = clearingData.filter(r => r.energy_type == null).length;
+  console.log(`[GC-Issue] 其中可再生能源记录 ${renewableCount} 条，energy_type 为空 ${nullEnergyTypeCount} 条`);
+
+  if (nullEnergyTypeCount > 0) {
+    console.log('[GC-Issue] 警告: 存在 energy_type 为空的电厂记录，请检查电厂注册时是否设置了 energy_type');
+    const nullGenerators = [...new Set(clearingData.filter(r => r.energy_type == null).map(r => r.generator_code))];
+    console.log(`[GC-Issue] energy_type 为空的电厂: ${nullGenerators.join(', ')}`);
+  }
+
   const consumerAllocations = db.prepare(`
     SELECT 
       cr.hour,
@@ -65,16 +77,24 @@ function issueGreenCertificatesForClearing(tradingDayId) {
 
     let totalIssued = 0;
     let totalTransferred = 0;
+    let skippedCount = 0;
 
     const seqCounters = {};
 
     for (const row of clearingData) {
       if (!row.energy_type || !RENEWABLE_ENERGY_TYPES.includes(row.energy_type)) {
+        skippedCount++;
+        if (skippedCount <= 3) {
+          console.log(`[GC-Issue] 跳过 ${row.generator_code} (时段${row.hour}): energy_type=${row.energy_type}, 不在可再生列表中`);
+        }
         continue;
       }
 
       const quantity = Math.floor(row.quantity);
-      if (quantity <= 0) continue;
+      if (quantity <= 0) {
+        skippedCount++;
+        continue;
+      }
 
       const counterKey = `${row.generator_id}-${row.hour}`;
       seqCounters[counterKey] = (seqCounters[counterKey] || 0) + 1;
@@ -128,7 +148,7 @@ function issueGreenCertificatesForClearing(tradingDayId) {
               transferQty,
               consumerAlloc.consumer_id,
               'transferred',
-              'auto_issue'
+              'auto_allocation'
             );
 
             insertTransfer.run(
@@ -154,6 +174,8 @@ function issueGreenCertificatesForClearing(tradingDayId) {
         }
       }
     }
+
+    console.log(`[GC-Issue] 共跳过 ${skippedCount} 条记录，发放 ${totalIssued} 张绿证，自动划转 ${totalTransferred} 张`);
 
     return { totalIssued, totalTransferred };
   });
@@ -234,13 +256,22 @@ function getGeneratorGcAccount(generatorId, year = null) {
   const summary = db.prepare(`
     SELECT 
       SUM(CASE WHEN gc.source = 'auto_issue' THEN gc.quantity ELSE 0 END) as total_issued,
-      SUM(CASE WHEN gc.owner_id = ? AND gc.status = 'available' THEN gc.quantity ELSE 0 END) as available,
-      SUM(CASE WHEN gc.status = 'transferred' THEN gc.quantity ELSE 0 END) as transferred,
+      SUM(CASE WHEN gc.owner_id = ? AND gc.status = 'available' AND gc.source = 'auto_issue' THEN gc.quantity ELSE 0 END) as available,
+      SUM(CASE WHEN (gc.source = 'auto_allocation' AND gc.status = 'transferred') OR (gc.source = 'auto_issue' AND gc.status = 'transferred') THEN gc.quantity ELSE 0 END) as transferred,
       SUM(CASE WHEN gc.status = 'traded' THEN gc.quantity ELSE 0 END) as traded
     FROM green_certificates gc
     WHERE gc.generator_id = ?
     ${year ? `AND strftime('%Y', gc.trade_date) = ?` : ''}
   `).get(...[generatorId, generatorId, ...(year ? [year.toString()] : [])]);
+
+  const autoAllocationSum = db.prepare(`
+    SELECT COALESCE(SUM(gc.quantity), 0) as total
+    FROM green_certificates gc
+    WHERE gc.generator_id = ? AND gc.source = 'auto_allocation'
+    ${year ? `AND strftime('%Y', gc.trade_date) = ?` : ''}
+  `).get(generatorId, ...(year ? [year.toString()] : [])).total;
+
+  summary.total_issued += autoAllocationSum;
 
   return {
     generator,
@@ -275,6 +306,8 @@ function getConsumerQuotaProgress(consumerId, year) {
       AND strftime('%Y', td.trade_date) = ?
   `).get(consumerId, year.toString()).total;
 
+  console.log(`[GC-Progress] ${consumerId} ${year}年总购电量: ${totalPurchase} MWh`);
+
   const obtainedGc = db.prepare(`
     SELECT COALESCE(SUM(gc.quantity), 0) as total
     FROM green_certificates gc
@@ -282,6 +315,27 @@ function getConsumerQuotaProgress(consumerId, year) {
       AND strftime('%Y', gc.trade_date) = ?
       AND gc.status IN ('transferred', 'traded', 'used')
   `).get(consumerId, year.toString()).total;
+
+  console.log(`[GC-Progress] ${consumerId} ${year}年已获得绿证: ${obtainedGc} 张`);
+
+  const autoAllocCount = db.prepare(`
+    SELECT COUNT(*) as cnt, COALESCE(SUM(gc.quantity), 0) as qty
+    FROM green_certificates gc
+    WHERE gc.owner_id = ?
+      AND strftime('%Y', gc.trade_date) = ?
+      AND gc.status = 'transferred'
+      AND gc.source = 'auto_allocation'
+  `).get(consumerId, year.toString());
+
+  const tradedCount = db.prepare(`
+    SELECT COUNT(*) as cnt, COALESCE(SUM(gc.quantity), 0) as qty
+    FROM green_certificates gc
+    WHERE gc.owner_id = ?
+      AND strftime('%Y', gc.trade_date) = ?
+      AND gc.status = 'traded'
+  `).get(consumerId, year.toString());
+
+  console.log(`[GC-Progress] 其中自动划转 ${autoAllocCount.qty} 张 (${autoAllocCount.cnt} 条), 交易获得 ${tradedCount.qty} 张 (${tradedCount.cnt} 条)`);
 
   const requiredGc = Math.ceil(totalPurchase * quota.quota_ratio);
   const completionRate = totalPurchase > 0 ? obtainedGc / requiredGc : 0;
