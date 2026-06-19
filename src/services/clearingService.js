@@ -1,11 +1,12 @@
 const { v4: uuidv4 } = require('uuid');
 const db = require('../utils/db');
 const { getTradingDayById } = require('./tradingDayService');
-const { listParticipants, getParticipantById } = require('./participantService');
+const { listParticipants, getParticipantById, isRenewableGenerator } = require('./participantService');
 const { getAllGeneratorBidsByHour, getAllConsumerBidsByHour } = require('./biddingService');
 const { listPriceZones, getParticipantZone } = require('./priceZoneService');
 const { listTieLines } = require('./tieLineService');
 const supervisionService = require('./supervisionService');
+const greenCertificateService = require('./greenCertificateService');
 
 function buildSupplyCurve(bids) {
   const sortedBids = [...bids].sort((a, b) => a.price - b.price);
@@ -651,6 +652,13 @@ function executeClearing(tradingDayId) {
     supervisionService.runFullAnalysis(tradingDayId);
   } catch (e) {
     console.error('[Supervision] 监管分析异常:', e.message);
+  }
+
+  try {
+    const gcResult = greenCertificateService.issueGreenCertificatesForClearing(tradingDayId);
+    console.log(`[GreenCertificate] 绿证发放完成: 发放${gcResult.total_certificates_issued}张, 自动划转${gcResult.total_auto_transferred}张`);
+  } catch (e) {
+    console.error('[GreenCertificate] 绿证发放异常:', e.message);
   }
 
   return getClearingSummary(tradingDayId);

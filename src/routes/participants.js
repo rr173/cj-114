@@ -45,4 +45,23 @@ router.get('/code/:code', (req, res) => {
   }
 });
 
+router.put('/:id/energy-type', (req, res) => {
+  try {
+    const { energy_type } = req.body;
+    const result = participantService.updateEnergyType(req.params.id, energy_type);
+    res.json({ success: true, data: result });
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+router.get('/renewable/generators', (req, res) => {
+  try {
+    const result = participantService.listRenewableGenerators();
+    res.json({ success: true, data: result });
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
 module.exports = router;

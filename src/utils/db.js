@@ -380,6 +380,119 @@ function initDatabase() {
       FOREIGN KEY (buy_participant_id) REFERENCES market_participants(id),
       FOREIGN KEY (sell_participant_id) REFERENCES market_participants(id)
     );
+
+    CREATE TABLE IF NOT EXISTS green_certificates (
+      id TEXT PRIMARY KEY,
+      certificate_no TEXT UNIQUE NOT NULL,
+      generator_id TEXT NOT NULL,
+      energy_type TEXT NOT NULL CHECK(energy_type IN ('wind', 'solar', 'hydro', 'biomass', 'geothermal')),
+      trading_day_id TEXT NOT NULL,
+      trade_date TEXT NOT NULL,
+      hour INTEGER NOT NULL CHECK(hour BETWEEN 0 AND 23),
+      quantity REAL NOT NULL,
+      owner_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'available' CHECK(status IN ('available', 'transferred', 'traded', 'used')),
+      source TEXT NOT NULL CHECK(source IN ('auto_issue', 'market_trade')),
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (generator_id) REFERENCES market_participants(id),
+      FOREIGN KEY (owner_id) REFERENCES market_participants(id),
+      FOREIGN KEY (trading_day_id) REFERENCES trading_days(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS gc_quota_settings (
+      id TEXT PRIMARY KEY,
+      year INTEGER NOT NULL UNIQUE,
+      quota_ratio REAL NOT NULL CHECK(quota_ratio BETWEEN 0 AND 1),
+      penalty_price REAL NOT NULL,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS gc_trading_sessions (
+      id TEXT PRIMARY KEY,
+      session_no TEXT UNIQUE NOT NULL,
+      year INTEGER NOT NULL,
+      month INTEGER NOT NULL CHECK(month BETWEEN 1 AND 12),
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'bidding', 'completed', 'cancelled')),
+      bid_start_time TEXT NOT NULL,
+      bid_end_time TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      UNIQUE(year, month)
+    );
+
+    CREATE TABLE IF NOT EXISTS gc_sell_orders (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      seller_id TEXT NOT NULL,
+      min_price REAL NOT NULL CHECK(min_price >= 0),
+      total_quantity INTEGER NOT NULL CHECK(total_quantity > 0),
+      remaining_quantity INTEGER NOT NULL CHECK(remaining_quantity >= 0),
+      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'partial', 'filled', 'cancelled')),
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (session_id) REFERENCES gc_trading_sessions(id),
+      FOREIGN KEY (seller_id) REFERENCES market_participants(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS gc_buy_orders (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      buyer_id TEXT NOT NULL,
+      max_price REAL NOT NULL CHECK(max_price >= 0),
+      demand_quantity INTEGER NOT NULL CHECK(demand_quantity > 0),
+      remaining_quantity INTEGER NOT NULL CHECK(remaining_quantity >= 0),
+      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'partial', 'filled', 'cancelled')),
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (session_id) REFERENCES gc_trading_sessions(id),
+      FOREIGN KEY (buyer_id) REFERENCES market_participants(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS gc_trades (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      sell_order_id TEXT NOT NULL,
+      buy_order_id TEXT NOT NULL,
+      seller_id TEXT NOT NULL,
+      buyer_id TEXT NOT NULL,
+      trade_quantity INTEGER NOT NULL CHECK(trade_quantity > 0),
+      trade_price REAL NOT NULL CHECK(trade_price >= 0),
+      total_amount REAL NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (session_id) REFERENCES gc_trading_sessions(id),
+      FOREIGN KEY (sell_order_id) REFERENCES gc_sell_orders(id),
+      FOREIGN KEY (buy_order_id) REFERENCES gc_buy_orders(id),
+      FOREIGN KEY (seller_id) REFERENCES market_participants(id),
+      FOREIGN KEY (buyer_id) REFERENCES market_participants(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS gc_transfer_records (
+      id TEXT PRIMARY KEY,
+      certificate_id TEXT NOT NULL,
+      from_participant_id TEXT NOT NULL,
+      to_participant_id TEXT NOT NULL,
+      transfer_type TEXT NOT NULL CHECK(transfer_type IN ('auto_allocation', 'market_trade', 'manual_transfer')),
+      trade_id TEXT,
+      reference_no TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (certificate_id) REFERENCES green_certificates(id),
+      FOREIGN KEY (from_participant_id) REFERENCES market_participants(id),
+      FOREIGN KEY (to_participant_id) REFERENCES market_participants(id),
+      FOREIGN KEY (trade_id) REFERENCES gc_trades(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS gc_annual_assessments (
+      id TEXT PRIMARY KEY,
+      year INTEGER NOT NULL,
+      participant_id TEXT NOT NULL,
+      total_purchase REAL NOT NULL DEFAULT 0,
+      required_gc INTEGER NOT NULL DEFAULT 0,
+      obtained_gc INTEGER NOT NULL DEFAULT 0,
+      completion_rate REAL NOT NULL DEFAULT 0,
+      is_compliant INTEGER NOT NULL DEFAULT 0,
+      deficit_quantity INTEGER NOT NULL DEFAULT 0,
+      penalty_amount REAL NOT NULL DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (participant_id) REFERENCES market_participants(id),
+      UNIQUE(year, participant_id)
+    );
   `);
 }
 
@@ -389,6 +502,7 @@ try { db.exec(`ALTER TABLE trading_days ADD COLUMN frequency_demand REAL`); } ca
 try { db.exec(`ALTER TABLE trading_days ADD COLUMN reserve_demand REAL`); } catch (e) {}
 try { db.exec(`ALTER TABLE settlement_details ADD COLUMN exempt_amount REAL DEFAULT 0`); } catch (e) {}
 try { db.exec(`ALTER TABLE clearing_results ADD COLUMN clearing_type TEXT DEFAULT 'unified' CHECK(clearing_type IN ('unified', 'zoned'))`); } catch (e) {}
+try { db.exec(`ALTER TABLE market_participants ADD COLUMN energy_type TEXT CHECK(energy_type IN ('wind', 'solar', 'hydro', 'biomass', 'geothermal', 'thermal', 'nuclear', 'other'))`); } catch (e) {}
 
 try {
   const migrateSettlement = db.transaction(() => {
