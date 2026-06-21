@@ -201,14 +201,14 @@ logTest('11. 创建多个交易日并完成现货出清', () => {
   }
 });
 
-logTest('12. 查询容量缺失事件', () => {
+logTest('12. 查询容量缺失事件 - 无检修故障时不应有缺失', () => {
   const events = capacityMarketService.getShortageEvents('2024-06');
-  assert(events.length > 0, '应该有容量缺失事件');
+  assert.strictEqual(events.length, 0, '无检修故障时不应有容量缺失事件');
 });
 
-logTest('13. 查询某电厂容量缺失事件', () => {
+logTest('13. 查询某电厂容量缺失事件 - 无检修故障时应为空', () => {
   const events = capacityMarketService.getShortageEvents('2024-06', gen2.id);
-  assert(events.length > 0, 'gen2 应该有容量缺失事件');
+  assert.strictEqual(events.length, 0, 'gen2 无检修故障时不应有容量缺失事件');
 });
 
 logTest('14. 计算月度可用性考核', () => {
@@ -218,12 +218,18 @@ logTest('14. 计算月度可用性考核', () => {
   assert.strictEqual(assessment.assessments.length, 2);
 });
 
-logTest('15. 验证可用性考核计算', () => {
+logTest('15. 验证可用性考核计算 - 无检修故障时100%可用', () => {
   const assessment = capacityMarketService.getAvailabilityAssessments('2024-06');
   const gen2Assessment = assessment.assessments.find(a => a.participant_id === gen2.id);
   assert(gen2Assessment, 'gen2 考核结果不存在');
-  assert(gen2Assessment.availability_rate < 0.95, 'gen2 可用率应该低于95%');
-  assert(gen2Assessment.deduction_amount > 0, 'gen2 应该有扣减');
+  assert.strictEqual(gen2Assessment.availability_rate, 1, 'gen2 无检修故障时可用率应为100%');
+  assert.strictEqual(gen2Assessment.deduction_amount, 0, 'gen2 无检修故障时不应有扣减');
+  assert.strictEqual(gen2Assessment.is_compliant, 1, 'gen2 应达标');
+  assert.strictEqual(gen2Assessment.final_compensation, gen2Assessment.original_compensation, 'gen2 无扣减时最终补偿应等于原始补偿');
+
+  const gen1Assessment = assessment.assessments.find(a => a.participant_id === gen1.id);
+  assert.strictEqual(gen1Assessment.availability_rate, 1, 'gen1 可用率应为100%');
+  assert.strictEqual(gen1Assessment.deduction_amount, 0, 'gen1 不应有扣减');
 });
 
 logTest('16. 生成分月容量结算单', () => {
@@ -233,37 +239,46 @@ logTest('16. 生成分月容量结算单', () => {
   assert(settlement.consumer_settlements.length === 3);
 });
 
-logTest('17. 验证结算单金额平衡', () => {
+logTest('17. 验证结算单金额平衡 - 无扣减时全额支付', () => {
   const settlement = capacityMarketService.getSettlement('2024-06');
   assert(settlement != null);
+  
+  assert(settlement.total_deduction === 0, '无扣减时总扣减应为0');
+  assert(settlement.net_payable === settlement.total_compensation, '无扣减时净支付应等于总补偿');
   
   const totalGenCompensation = settlement.generator_settlements.reduce((sum, g) => sum + g.net_compensation, 0);
   const totalConsumerPayable = settlement.consumer_settlements.reduce((sum, c) => sum + c.net_amount, 0);
   
   assert(Math.abs(totalGenCompensation - settlement.net_payable) < 0.01, '电厂应收净额应等于净支付总额');
   assert(Math.abs(totalGenCompensation - totalConsumerPayable) < 0.01, '电厂应收应等于售电公司应付');
+
+  const expectedTotal = 200 * 80000 + 375 * 80000;
+  assert.strictEqual(settlement.total_compensation, expectedTotal, '总补偿应等于两家中标电厂补偿之和');
 });
 
-logTest('18. 验证售电公司分摊按义务占比分摊', () => {
+logTest('18. 验证售电公司分摊按义务占比分摊 - 无扣减时全额分摊', () => {
   const settlement = capacityMarketService.getSettlement('2024-06');
   const totalObligation = settlement.consumer_settlements.reduce((sum, c) => sum + c.obligation_mw, 0);
+  
+  assert(settlement.net_payable > 0, '净支付应大于0');
   
   settlement.consumer_settlements.forEach(c => {
     const expectedRatio = c.obligation_mw / totalObligation;
     const storedRatio = c.share_ratio;
     assert(Math.abs(expectedRatio - storedRatio) < 0.001, '存储的分摊比例应与义务占比一致');
-    if (settlement.net_payable > 0) {
-      const actualRatioFromNet = c.net_amount / settlement.net_payable;
-      assert(Math.abs(expectedRatio - actualRatioFromNet) < 0.001, '实际净支付比例应与义务占比一致');
-    }
+    const actualRatioFromNet = c.net_amount / settlement.net_payable;
+    assert(Math.abs(expectedRatio - actualRatioFromNet) < 0.001, '实际净支付比例应与义务占比一致');
+    assert(c.net_amount > 0, '售电公司应付金额应大于0');
   });
 
   settlement.generator_settlements.forEach(g => {
     assert(g.capacity_mw != null, '电厂容量应存在');
     assert(g.total_compensation != null, '电厂总补偿应存在');
-    assert(g.net_compensation != null, '电厂净补偿应存在');
-    assert(g.availability_rate != null, '电厂可用率应存在');
-    assert(g.shortage_periods != null, '电厂缺失时段数应存在');
+    assert(g.total_compensation > 0, '电厂总补偿应大于0');
+    assert.strictEqual(g.total_deduction, 0, '电厂扣减应为0');
+    assert.strictEqual(g.net_compensation, g.total_compensation, '电厂净补偿应等于总补偿');
+    assert(g.availability_rate === 1, '电厂可用率应为100%');
+    assert(g.shortage_periods === 0, '电厂缺失时段数应为0');
   });
 });
 

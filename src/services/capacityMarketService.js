@@ -417,21 +417,6 @@ function checkCapacityAvailability(tradingDayId) {
     WHERE cca.month = ? AND cca.is_winner = 1
   `).all(month);
 
-  const dispatchResults = db.prepare(`
-    SELECT ca.participant_id, cr.hour, ca.final_dispatch
-    FROM clearing_results cr
-    JOIN clearing_allocations ca ON cr.id = ca.clearing_result_id
-    WHERE cr.trading_day_id = ?
-  `).all(tradingDayId);
-
-  const dispatchByParticipant = {};
-  for (const dr of dispatchResults) {
-    if (!dispatchByParticipant[dr.participant_id]) {
-      dispatchByParticipant[dr.participant_id] = {};
-    }
-    dispatchByParticipant[dr.participant_id][dr.hour] = dr.final_dispatch;
-  }
-
   const shortageEvents = [];
 
   const tx = db.transaction(() => {
@@ -447,8 +432,7 @@ function checkCapacityAvailability(tradingDayId) {
       const installed = winner.installed_capacity;
 
       for (let hour = 0; hour < 24; hour++) {
-        const dispatched = dispatchByParticipant[winner.participant_id]?.[hour] || 0;
-        const actualAvailable = installed - dispatched;
+        const actualAvailable = installed;
 
         if (actualAvailable < committed) {
           const shortage = committed - actualAvailable;
