@@ -9,6 +9,7 @@ const { getIntradayNetVolumes } = require('./intradayService');
 const POSITIVE_DEVIATION_RATIO = 0.8;
 const NEGATIVE_DEVIATION_RATIO = 1.2;
 const OPEN_DISPUTE_STATUSES = ['pending', 'accepted', 'recalculating', 'reviewing'];
+const MODIFIABLE_DISPUTE_STATUSES = ['accepted'];
 
 function _hasOpenDisputes(tradingDayId, participantId = null) {
   const placeholders = OPEN_DISPUTE_STATUSES.map(() => '?').join(',');
@@ -29,6 +30,17 @@ function _hasOpenDisputes(tradingDayId, participantId = null) {
   return !!row;
 }
 
+function _hasModifiableDispute(tradingDayId, participantId) {
+  const placeholders = MODIFIABLE_DISPUTE_STATUSES.map(() => '?').join(',');
+  const row = db.prepare(`
+    SELECT id FROM settlement_disputes
+    WHERE trading_day_id = ? AND participant_id = ?
+    AND status IN (${placeholders})
+    LIMIT 1
+  `).get(tradingDayId, participantId, ...MODIFIABLE_DISPUTE_STATUSES);
+  return !!row;
+}
+
 function submitActualVolumes(tradingDayId, participantId, volumes) {
   const td = getTradingDayById(tradingDayId);
   if (!td) {
@@ -37,11 +49,8 @@ function submitActualVolumes(tradingDayId, participantId, volumes) {
   if (td.status === 'bidding') {
     throw new Error('该交易日尚未出清');
   }
-  if (td.status === 'settled') {
-    throw new Error('该交易日已完成结算，不可修改实际量');
-  }
-  if (_hasOpenDisputes(tradingDayId, participantId)) {
-    throw new Error('该主体对该交易日有未关闭的争议，实际量已锁定');
+  if (td.status === 'settled' && !_hasModifiableDispute(tradingDayId, participantId)) {
+    throw new Error('该交易日已完成结算，不可修改实际量。如需修正，请先发起争议申请，待受理后可修正数据并重算');
   }
 
   const p = getParticipantById(participantId);
