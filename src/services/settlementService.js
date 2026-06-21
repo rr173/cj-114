@@ -8,6 +8,26 @@ const { getIntradayNetVolumes } = require('./intradayService');
 
 const POSITIVE_DEVIATION_RATIO = 0.8;
 const NEGATIVE_DEVIATION_RATIO = 1.2;
+const OPEN_DISPUTE_STATUSES = ['pending', 'accepted', 'recalculating', 'reviewing'];
+
+function _hasOpenDisputes(tradingDayId, participantId = null) {
+  const placeholders = OPEN_DISPUTE_STATUSES.map(() => '?').join(',');
+  let sql = `
+    SELECT id FROM settlement_disputes
+    WHERE trading_day_id = ?
+    AND status IN (${placeholders})
+  `;
+  const args = [tradingDayId, ...OPEN_DISPUTE_STATUSES];
+
+  if (participantId) {
+    sql += ' AND participant_id = ?';
+    args.push(participantId);
+  }
+
+  sql += ' LIMIT 1';
+  const row = db.prepare(sql).get(...args);
+  return !!row;
+}
 
 function submitActualVolumes(tradingDayId, participantId, volumes) {
   const td = getTradingDayById(tradingDayId);
@@ -19,6 +39,9 @@ function submitActualVolumes(tradingDayId, participantId, volumes) {
   }
   if (td.status === 'settled') {
     throw new Error('该交易日已完成结算，不可修改实际量');
+  }
+  if (_hasOpenDisputes(tradingDayId, participantId)) {
+    throw new Error('该主体对该交易日有未关闭的争议，实际量已锁定');
   }
 
   const p = getParticipantById(participantId);
@@ -103,8 +126,11 @@ function executeSettlement(tradingDayId) {
   if (!td) {
     throw new Error('交易日不存在');
   }
-  if (td.status !== 'cleared') {
-    throw new Error('只有已出清的交易日可以执行结算');
+  if (td.status !== 'cleared' && td.status !== 'settled') {
+    throw new Error('只有已出清或已结算的交易日可以执行结算');
+  }
+  if (_hasOpenDisputes(tradingDayId)) {
+    throw new Error('该交易日存在未关闭的争议，原结算数据已锁定，不可覆盖');
   }
 
   decomposeContractsForDate(td.trade_date);

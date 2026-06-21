@@ -626,6 +626,56 @@ function initDatabase() {
       FOREIGN KEY (participant_id) REFERENCES market_participants(id),
       UNIQUE(settlement_id, participant_id)
     );
+
+    CREATE TABLE IF NOT EXISTS settlement_disputes (
+      id TEXT PRIMARY KEY,
+      trading_day_id TEXT NOT NULL,
+      participant_id TEXT NOT NULL,
+      dispute_type TEXT NOT NULL CHECK(dispute_type IN ('deviation_error', 'clearing_price_error', 'contract_decomposition_error')),
+      description TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'accepted', 'recalculating', 'reviewing', 'adopted', 'rejected', 'withdrawn')),
+      reject_reason TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (trading_day_id) REFERENCES trading_days(id),
+      FOREIGN KEY (participant_id) REFERENCES market_participants(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS settlement_recalculations (
+      id TEXT PRIMARY KEY,
+      dispute_id TEXT NOT NULL,
+      trading_day_id TEXT NOT NULL,
+      participant_id TEXT NOT NULL,
+      hour INTEGER NOT NULL CHECK(hour BETWEEN 0 AND 23),
+      item_type TEXT NOT NULL CHECK(item_type IN ('contract', 'spot', 'deviation', 'congestion_surplus', 'intraday')),
+      contract_id TEXT,
+      volume REAL NOT NULL,
+      direction TEXT,
+      unit_price REAL NOT NULL,
+      amount REAL NOT NULL,
+      exempt_amount REAL DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (dispute_id) REFERENCES settlement_disputes(id),
+      FOREIGN KEY (trading_day_id) REFERENCES trading_days(id),
+      FOREIGN KEY (participant_id) REFERENCES market_participants(id),
+      FOREIGN KEY (contract_id) REFERENCES mid_long_term_contracts(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS settlement_dispute_refunds (
+      id TEXT PRIMARY KEY,
+      dispute_id TEXT NOT NULL,
+      participant_id TEXT NOT NULL,
+      trading_day_id TEXT NOT NULL,
+      hour INTEGER NOT NULL CHECK(hour BETWEEN 0 AND 23),
+      original_amount REAL NOT NULL,
+      recalculated_amount REAL NOT NULL,
+      difference_amount REAL NOT NULL,
+      refund_type TEXT NOT NULL CHECK(refund_type IN ('refund', 'recovery')),
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (dispute_id) REFERENCES settlement_disputes(id),
+      FOREIGN KEY (trading_day_id) REFERENCES trading_days(id),
+      FOREIGN KEY (participant_id) REFERENCES market_participants(id)
+    );
   `);
 }
 
