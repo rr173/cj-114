@@ -676,6 +676,151 @@ function initDatabase() {
       FOREIGN KEY (trading_day_id) REFERENCES trading_days(id),
       FOREIGN KEY (participant_id) REFERENCES market_participants(id)
     );
+
+    CREATE TABLE IF NOT EXISTS ftr_auctions (
+      id TEXT PRIMARY KEY,
+      auction_no TEXT UNIQUE NOT NULL,
+      month TEXT NOT NULL,
+      tie_line_id TEXT NOT NULL,
+      direction_zone_from TEXT NOT NULL,
+      direction_zone_to TEXT NOT NULL,
+      total_capacity_mw REAL NOT NULL CHECK(total_capacity_mw > 0),
+      max_single_participant_ratio REAL NOT NULL DEFAULT 0.3,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'bidding', 'closed', 'cleared', 'cancelled')),
+      bid_start_time TEXT,
+      bid_end_time TEXT,
+      clearing_price REAL,
+      total_cleared_capacity_mw REAL DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (tie_line_id) REFERENCES tie_lines(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS ftr_bids (
+      id TEXT PRIMARY KEY,
+      auction_id TEXT NOT NULL,
+      participant_id TEXT NOT NULL,
+      bid_capacity_mw REAL NOT NULL CHECK(bid_capacity_mw > 0),
+      bid_price REAL NOT NULL CHECK(bid_price >= 0),
+      status TEXT NOT NULL DEFAULT 'submitted' CHECK(status IN ('submitted', 'accepted', 'rejected', 'partial', 'cancelled')),
+      cleared_capacity_mw REAL DEFAULT 0,
+      clearing_price REAL,
+      payment_amount REAL DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (auction_id) REFERENCES ftr_auctions(id),
+      FOREIGN KEY (participant_id) REFERENCES market_participants(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS ftr_holdings (
+      id TEXT PRIMARY KEY,
+      auction_id TEXT NOT NULL,
+      bid_id TEXT NOT NULL,
+      participant_id TEXT NOT NULL,
+      month TEXT NOT NULL,
+      tie_line_id TEXT NOT NULL,
+      direction_zone_from TEXT NOT NULL,
+      direction_zone_to TEXT NOT NULL,
+      holding_capacity_mw REAL NOT NULL CHECK(holding_capacity_mw > 0),
+      clearing_price REAL NOT NULL,
+      total_payment REAL NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'settled', 'expired')),
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (auction_id) REFERENCES ftr_auctions(id),
+      FOREIGN KEY (bid_id) REFERENCES ftr_bids(id),
+      FOREIGN KEY (participant_id) REFERENCES market_participants(id),
+      FOREIGN KEY (tie_line_id) REFERENCES tie_lines(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS ftr_daily_settlements (
+      id TEXT PRIMARY KEY,
+      trading_day_id TEXT NOT NULL,
+      trade_date TEXT NOT NULL,
+      hour INTEGER NOT NULL CHECK(hour BETWEEN 0 AND 23),
+      tie_line_id TEXT NOT NULL,
+      congestion_price_diff REAL NOT NULL DEFAULT 0,
+      actual_flow_mw REAL NOT NULL DEFAULT 0,
+      total_congestion_surplus REAL NOT NULL DEFAULT 0,
+      total_ftr_payment REAL NOT NULL DEFAULT 0,
+      surplus_to_pool REAL NOT NULL DEFAULT 0,
+      settlement_note TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (trading_day_id) REFERENCES trading_days(id),
+      FOREIGN KEY (tie_line_id) REFERENCES tie_lines(id),
+      UNIQUE(trading_day_id, hour, tie_line_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS ftr_daily_settlement_items (
+      id TEXT PRIMARY KEY,
+      settlement_id TEXT NOT NULL,
+      holding_id TEXT NOT NULL,
+      participant_id TEXT NOT NULL,
+      holding_capacity_mw REAL NOT NULL,
+      congestion_price_diff REAL NOT NULL,
+      original_income REAL NOT NULL,
+      prorated_ratio REAL NOT NULL DEFAULT 1,
+      final_income REAL NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (settlement_id) REFERENCES ftr_daily_settlements(id) ON DELETE CASCADE,
+      FOREIGN KEY (holding_id) REFERENCES ftr_holdings(id),
+      FOREIGN KEY (participant_id) REFERENCES market_participants(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS congestion_surplus_pool (
+      id TEXT PRIMARY KEY,
+      month TEXT NOT NULL UNIQUE,
+      opening_balance REAL NOT NULL DEFAULT 0,
+      monthly_addition REAL NOT NULL DEFAULT 0,
+      total_refunded REAL NOT NULL DEFAULT 0,
+      closing_balance REAL NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'accumulating' CHECK(status IN ('accumulating', 'refunded', 'carried_forward')),
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS congestion_surplus_refunds (
+      id TEXT PRIMARY KEY,
+      pool_id TEXT NOT NULL,
+      month TEXT NOT NULL,
+      participant_id TEXT NOT NULL,
+      total_purchase_mwh REAL NOT NULL,
+      total_market_purchase_mwh REAL NOT NULL,
+      share_ratio REAL NOT NULL,
+      refund_amount REAL NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (pool_id) REFERENCES congestion_surplus_pool(id),
+      FOREIGN KEY (participant_id) REFERENCES market_participants(id),
+      UNIQUE(pool_id, participant_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS ftr_monthly_reports (
+      id TEXT PRIMARY KEY,
+      month TEXT NOT NULL UNIQUE,
+      total_auctions INTEGER NOT NULL DEFAULT 0,
+      total_ftr_holders INTEGER NOT NULL DEFAULT 0,
+      total_holding_capacity_mw REAL NOT NULL DEFAULT 0,
+      total_auction_payment REAL NOT NULL DEFAULT 0,
+      total_settlement_income REAL NOT NULL DEFAULT 0,
+      total_net_benefit REAL NOT NULL DEFAULT 0,
+      total_congestion_surplus REAL NOT NULL DEFAULT 0,
+      total_ftr_paid REAL NOT NULL DEFAULT 0,
+      total_surplus_to_pool REAL NOT NULL DEFAULT 0,
+      pool_refund_total REAL NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft', 'finalized')),
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS ftr_monthly_report_items (
+      id TEXT PRIMARY KEY,
+      report_id TEXT NOT NULL,
+      participant_id TEXT NOT NULL,
+      holding_capacity_mw REAL NOT NULL DEFAULT 0,
+      monthly_income REAL NOT NULL DEFAULT 0,
+      auction_payment REAL NOT NULL DEFAULT 0,
+      net_benefit REAL NOT NULL DEFAULT 0,
+      pool_refund_amount REAL DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (report_id) REFERENCES ftr_monthly_reports(id) ON DELETE CASCADE,
+      FOREIGN KEY (participant_id) REFERENCES market_participants(id),
+      UNIQUE(report_id, participant_id)
+    );
   `);
 }
 

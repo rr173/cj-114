@@ -14,6 +14,7 @@ const intradayRouter = require('./routes/intraday');
 const greenCertificatesRouter = require('./routes/greenCertificates');
 const capacityMarketRouter = require('./routes/capacityMarket');
 const settlementDisputesRouter = require('./routes/settlementDisputes');
+const ftrRouter = require('./routes/ftr');
 
 const app = express();
 
@@ -33,6 +34,7 @@ app.use('/api/intraday', intradayRouter);
 app.use('/api/green-certificates', greenCertificatesRouter);
 app.use('/api/capacity-market', capacityMarketRouter);
 app.use('/api/settlement-disputes', settlementDisputesRouter);
+app.use('/api/ftr', ftrRouter);
 
 app.get('/api/health', (req, res) => {
   res.json({
