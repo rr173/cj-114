@@ -7,6 +7,7 @@ const { listPriceZones, getParticipantZone } = require('./priceZoneService');
 const { listTieLines } = require('./tieLineService');
 const supervisionService = require('./supervisionService');
 const greenCertificateService = require('./greenCertificateService');
+const capacityMarketService = require('./capacityMarketService');
 
 function buildSupplyCurve(bids) {
   const sortedBids = [...bids].sort((a, b) => a.price - b.price);
@@ -659,6 +660,15 @@ function executeClearing(tradingDayId) {
     console.log(`[GreenCertificate] 绿证发放完成: 发放${gcResult.total_certificates_issued}张, 自动划转${gcResult.total_auto_transferred}张`);
   } catch (e) {
     console.error('[GreenCertificate] 绿证发放异常:', e.message);
+  }
+
+  try {
+    const capacityCheck = capacityMarketService.checkCapacityAvailability(tradingDayId);
+    if (capacityCheck.checked && capacityCheck.new_shortage_events > 0) {
+      console.log(`[CapacityMarket] 容量可用性检查完成: 发现${capacityCheck.new_shortage_events}个容量缺失事件`);
+    }
+  } catch (e) {
+    console.error('[CapacityMarket] 容量可用性检查异常:', e.message);
   }
 
   return getClearingSummary(tradingDayId);

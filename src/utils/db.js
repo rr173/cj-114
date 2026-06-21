@@ -493,6 +493,139 @@ function initDatabase() {
       FOREIGN KEY (participant_id) REFERENCES market_participants(id),
       UNIQUE(year, participant_id)
     );
+
+    CREATE TABLE IF NOT EXISTS capacity_demands (
+      id TEXT PRIMARY KEY,
+      month TEXT NOT NULL UNIQUE,
+      total_demand_mw REAL NOT NULL,
+      reserve_margin REAL NOT NULL DEFAULT 0.15,
+      peak_load_forecast REAL NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'cancelled')),
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS capacity_obligations (
+      id TEXT PRIMARY KEY,
+      month TEXT NOT NULL,
+      participant_id TEXT NOT NULL,
+      obligation_mw REAL NOT NULL,
+      purchase_share REAL NOT NULL,
+      last_month_purchase REAL NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (participant_id) REFERENCES market_participants(id),
+      UNIQUE(month, participant_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS capacity_bidding_sessions (
+      id TEXT PRIMARY KEY,
+      month TEXT NOT NULL UNIQUE,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'bidding', 'closed', 'cleared')),
+      bid_start_time TEXT,
+      bid_end_time TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS capacity_bids (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      month TEXT NOT NULL,
+      participant_id TEXT NOT NULL,
+      offered_capacity_mw REAL NOT NULL,
+      price_yuan_per_mw_month REAL NOT NULL,
+      max_offer_capacity_mw REAL NOT NULL,
+      contracted_capacity_mw REAL NOT NULL DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (session_id) REFERENCES capacity_bidding_sessions(id),
+      FOREIGN KEY (participant_id) REFERENCES market_participants(id),
+      UNIQUE(session_id, participant_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS capacity_clearing_results (
+      id TEXT PRIMARY KEY,
+      month TEXT NOT NULL UNIQUE,
+      clearing_price_yuan_per_mw REAL NOT NULL,
+      total_cleared_capacity_mw REAL NOT NULL,
+      total_demand_mw REAL NOT NULL,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS capacity_clearing_allocations (
+      id TEXT PRIMARY KEY,
+      clearing_result_id TEXT NOT NULL,
+      participant_id TEXT NOT NULL,
+      month TEXT NOT NULL,
+      committed_capacity_mw REAL NOT NULL,
+      clearing_price_yuan_per_mw REAL NOT NULL,
+      monthly_compensation_yuan REAL NOT NULL,
+      is_winner INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (clearing_result_id) REFERENCES capacity_clearing_results(id),
+      FOREIGN KEY (participant_id) REFERENCES market_participants(id),
+      UNIQUE(clearing_result_id, participant_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS capacity_shortage_events (
+      id TEXT PRIMARY KEY,
+      month TEXT NOT NULL,
+      participant_id TEXT NOT NULL,
+      trading_day_id TEXT NOT NULL,
+      trade_date TEXT NOT NULL,
+      hour INTEGER NOT NULL CHECK(hour BETWEEN 0 AND 23),
+      committed_capacity_mw REAL NOT NULL,
+      actual_available_mw REAL NOT NULL,
+      shortage_mw REAL NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (participant_id) REFERENCES market_participants(id),
+      FOREIGN KEY (trading_day_id) REFERENCES trading_days(id),
+      UNIQUE(participant_id, trading_day_id, hour)
+    );
+
+    CREATE TABLE IF NOT EXISTS capacity_availability_assessments (
+      id TEXT PRIMARY KEY,
+      month TEXT NOT NULL,
+      participant_id TEXT NOT NULL,
+      committed_capacity_mw REAL NOT NULL,
+      total_required_periods INTEGER NOT NULL,
+      available_periods INTEGER NOT NULL,
+      availability_rate REAL NOT NULL,
+      threshold_rate REAL NOT NULL DEFAULT 0.95,
+      is_compliant INTEGER NOT NULL DEFAULT 1,
+      original_compensation REAL NOT NULL,
+      deduction_ratio REAL NOT NULL DEFAULT 0,
+      deduction_amount REAL NOT NULL DEFAULT 0,
+      final_compensation REAL NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (participant_id) REFERENCES market_participants(id),
+      UNIQUE(month, participant_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS capacity_settlements (
+      id TEXT PRIMARY KEY,
+      month TEXT NOT NULL,
+      total_compensation REAL NOT NULL,
+      total_deduction REAL NOT NULL,
+      net_payable REAL NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      UNIQUE(month)
+    );
+
+    CREATE TABLE IF NOT EXISTS capacity_settlement_items (
+      id TEXT PRIMARY KEY,
+      settlement_id TEXT NOT NULL,
+      participant_id TEXT NOT NULL,
+      month TEXT NOT NULL,
+      role TEXT NOT NULL CHECK(role IN ('generator', 'consumer')),
+      obligation_mw REAL,
+      committed_capacity_mw REAL,
+      share_ratio REAL,
+      original_amount REAL,
+      deduction_amount REAL,
+      net_amount REAL NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (settlement_id) REFERENCES capacity_settlements(id),
+      FOREIGN KEY (participant_id) REFERENCES market_participants(id),
+      UNIQUE(settlement_id, participant_id)
+    );
   `);
 }
 
