@@ -214,6 +214,13 @@ function calculateViolationScore(participantId, monthStr) {
   return { count: violationCount, score };
 }
 
+function _shouldBeRestricted(score, prev1, prev2) {
+  if (score >= 60) return 0;
+  if (score < 50) return 1;
+  if (prev1 && prev2 && prev1.score < 50 && prev2.score < 50) return 1;
+  return 0;
+}
+
 function calculateCreditScore(participantId, monthStr) {
   const settlement = calculateSettlementTimeliness(participantId, monthStr);
   const deviation = calculateDeviationControl(participantId, monthStr);
@@ -243,13 +250,7 @@ function calculateCreditScore(participantId, monthStr) {
   const prev1 = prevScores.find(s => s.month === prevMonthStr);
   const prev2 = prevScores.find(s => s.month === prevMonth2Str);
   
-  let tradingRestricted = 0;
-  if (prev1 && prev2 && prev1.score < 50 && prev2.score < 50 && totalScore < 60) {
-    tradingRestricted = 1;
-  }
-  if (totalScore >= 60) {
-    tradingRestricted = 0;
-  }
+  const tradingRestricted = _shouldBeRestricted(totalScore, prev1, prev2);
 
   return {
     score: Math.round(totalScore * 100) / 100,
@@ -275,8 +276,8 @@ function recalculateAllCreditScores(monthStr = null) {
       INSERT INTO credit_scores 
       (id, participant_id, month, score, level, settlement_timeliness, settlement_timeliness_score,
        deviation_control, deviation_control_score, contract_performance, contract_performance_score,
-       violation_count, violation_score, trading_restricted)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       violation_count, violation_score, trading_restricted, manually_adjusted)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
       ON CONFLICT(participant_id, month) DO UPDATE SET
         score = excluded.score,
         level = excluded.level,
@@ -289,26 +290,68 @@ function recalculateAllCreditScores(monthStr = null) {
         violation_count = excluded.violation_count,
         violation_score = excluded.violation_score,
         trading_restricted = excluded.trading_restricted
+      WHERE credit_scores.manually_adjusted = 0
+    `);
+
+    const updateFactorsOnlyStmt = db.prepare(`
+      UPDATE credit_scores SET
+        settlement_timeliness = ?,
+        settlement_timeliness_score = ?,
+        deviation_control = ?,
+        deviation_control_score = ?,
+        contract_performance = ?,
+        contract_performance_score = ?,
+        violation_count = ?,
+        violation_score = ?
+      WHERE participant_id = ? AND month = ? AND manually_adjusted = 1
     `);
 
     const results = [];
     for (const p of participants) {
       const creditData = calculateCreditScore(p.id, targetMonth);
       const existing = db.prepare(`
-        SELECT id FROM credit_scores WHERE participant_id = ? AND month = ?
+        SELECT id, manually_adjusted FROM credit_scores WHERE participant_id = ? AND month = ?
       `).get(p.id, targetMonth);
       
       const id = existing?.id || uuidv4();
-      upsertStmt.run(
-        id, p.id, targetMonth,
-        creditData.score, creditData.level,
-        creditData.settlement_timeliness, creditData.settlement_timeliness_score,
-        creditData.deviation_control, creditData.deviation_control_score,
-        creditData.contract_performance, creditData.contract_performance_score,
-        creditData.violation_count, creditData.violation_score,
-        creditData.trading_restricted
-      );
-      results.push({ participant_id: p.id, ...creditData });
+      const isManual = existing?.manually_adjusted === 1;
+      
+      if (isManual) {
+        updateFactorsOnlyStmt.run(
+          creditData.settlement_timeliness, creditData.settlement_timeliness_score,
+          creditData.deviation_control, creditData.deviation_control_score,
+          creditData.contract_performance, creditData.contract_performance_score,
+          creditData.violation_count, creditData.violation_score,
+          p.id, targetMonth
+        );
+        const updated = db.prepare(`SELECT * FROM credit_scores WHERE id = ?`).get(id);
+        results.push({ 
+          participant_id: p.id, 
+          manually_adjusted: 1,
+          score: updated.score,
+          level: updated.level,
+          trading_restricted: updated.trading_restricted,
+          settlement_timeliness: updated.settlement_timeliness,
+          settlement_timeliness_score: updated.settlement_timeliness_score,
+          deviation_control: updated.deviation_control,
+          deviation_control_score: updated.deviation_control_score,
+          contract_performance: updated.contract_performance,
+          contract_performance_score: updated.contract_performance_score,
+          violation_count: updated.violation_count,
+          violation_score: updated.violation_score
+        });
+      } else {
+        upsertStmt.run(
+          id, p.id, targetMonth,
+          creditData.score, creditData.level,
+          creditData.settlement_timeliness, creditData.settlement_timeliness_score,
+          creditData.deviation_control, creditData.deviation_control_score,
+          creditData.contract_performance, creditData.contract_performance_score,
+          creditData.violation_count, creditData.violation_score,
+          creditData.trading_restricted
+        );
+        results.push({ participant_id: p.id, ...creditData, manually_adjusted: 0 });
+      }
     }
     return results;
   });
@@ -328,8 +371,8 @@ function getCurrentCreditScore(participantId) {
       INSERT INTO credit_scores 
       (id, participant_id, month, score, level, settlement_timeliness, settlement_timeliness_score,
        deviation_control, deviation_control_score, contract_performance, contract_performance_score,
-       violation_count, violation_score, trading_restricted)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       violation_count, violation_score, trading_restricted, manually_adjusted)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
     `).run(
       uuidv4(), participantId, currentMonth,
       data.score, data.level,
@@ -398,12 +441,30 @@ function adjustCreditScore(participantId, monthStr, newScore, reason, operator) 
   }
 
   const tx = db.transaction(() => {
-    const existing = db.prepare(`
+    let existing = db.prepare(`
       SELECT * FROM credit_scores WHERE participant_id = ? AND month = ?
     `).get(participantId, monthStr);
 
     if (!existing) {
-      throw new Error('该月份的信用记录不存在，请先触发信用重算');
+      const initData = calculateCreditScore(participantId, monthStr);
+      db.prepare(`
+        INSERT INTO credit_scores 
+        (id, participant_id, month, score, level, settlement_timeliness, settlement_timeliness_score,
+         deviation_control, deviation_control_score, contract_performance, contract_performance_score,
+         violation_count, violation_score, trading_restricted, manually_adjusted)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+      `).run(
+        uuidv4(), participantId, monthStr,
+        initData.score, initData.level,
+        initData.settlement_timeliness, initData.settlement_timeliness_score,
+        initData.deviation_control, initData.deviation_control_score,
+        initData.contract_performance, initData.contract_performance_score,
+        initData.violation_count, initData.violation_score,
+        initData.trading_restricted
+      );
+      existing = db.prepare(`
+        SELECT * FROM credit_scores WHERE participant_id = ? AND month = ?
+      `).get(participantId, monthStr);
     }
 
     const level = getCreditLevel(newScore);
@@ -424,17 +485,11 @@ function adjustCreditScore(participantId, monthStr, newScore, reason, operator) 
     const prev1 = prevScores.find(s => s.month === prevMonthStr);
     const prev2 = prevScores.find(s => s.month === prevMonth2Str);
     
-    let tradingRestricted = existing.trading_restricted;
-    if (prev1 && prev2 && prev1.score < 50 && prev2.score < 50 && newScore < 60) {
-      tradingRestricted = 1;
-    }
-    if (newScore >= 60) {
-      tradingRestricted = 0;
-    }
+    const tradingRestricted = _shouldBeRestricted(newScore, prev1, prev2);
 
     db.prepare(`
       UPDATE credit_scores 
-      SET score = ?, level = ?, trading_restricted = ?
+      SET score = ?, level = ?, trading_restricted = ?, manually_adjusted = 1
       WHERE participant_id = ? AND month = ?
     `).run(newScore, level, tradingRestricted, participantId, monthStr);
 
@@ -450,7 +505,8 @@ function adjustCreditScore(participantId, monthStr, newScore, reason, operator) 
       original_score: existing.score,
       adjusted_score: newScore,
       level,
-      trading_restricted: tradingRestricted
+      trading_restricted: tradingRestricted,
+      manually_adjusted: 1
     };
   });
 

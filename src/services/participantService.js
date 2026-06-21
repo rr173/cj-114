@@ -62,8 +62,8 @@ function registerParticipant(data) {
       INSERT INTO credit_scores 
       (id, participant_id, month, score, level, settlement_timeliness, settlement_timeliness_score,
        deviation_control, deviation_control_score, contract_performance, contract_performance_score,
-       violation_count, violation_score, trading_restricted)
-      VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+       violation_count, violation_score, trading_restricted, manually_adjusted)
+      VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
     `).run(uuidv4(), id, currentMonth, INITIAL_CREDIT_SCORE, initialLevel);
 
     db.prepare(`

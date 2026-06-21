@@ -837,6 +837,7 @@ function initDatabase() {
       violation_count INTEGER NOT NULL DEFAULT 0,
       violation_score REAL NOT NULL DEFAULT 0,
       trading_restricted INTEGER NOT NULL DEFAULT 0,
+      manually_adjusted INTEGER NOT NULL DEFAULT 0,
       created_at TEXT DEFAULT (datetime('now')),
       FOREIGN KEY (participant_id) REFERENCES market_participants(id),
       UNIQUE(participant_id, month)
@@ -905,6 +906,7 @@ try { db.exec(`ALTER TABLE trading_days ADD COLUMN reserve_demand REAL`); } catc
 try { db.exec(`ALTER TABLE settlement_details ADD COLUMN exempt_amount REAL DEFAULT 0`); } catch (e) {}
 try { db.exec(`ALTER TABLE clearing_results ADD COLUMN clearing_type TEXT DEFAULT 'unified' CHECK(clearing_type IN ('unified', 'zoned'))`); } catch (e) {}
 try { db.exec(`ALTER TABLE market_participants ADD COLUMN energy_type TEXT`); } catch (e) {}
+try { db.exec(`ALTER TABLE credit_scores ADD COLUMN manually_adjusted INTEGER NOT NULL DEFAULT 0`); } catch (e) {}
 
 try {
   const initCreditData = db.transaction(() => {
@@ -915,8 +917,8 @@ try {
       INSERT OR IGNORE INTO credit_scores 
       (id, participant_id, month, score, level, settlement_timeliness, settlement_timeliness_score,
        deviation_control, deviation_control_score, contract_performance, contract_performance_score,
-       violation_count, violation_score, trading_restricted)
-      VALUES (?, ?, ?, 70, 'A', 0, 0, 0, 0, 0, 0, 0, 0, 0)
+       violation_count, violation_score, trading_restricted, manually_adjusted)
+      VALUES (?, ?, ?, 70, 'A', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
     `);
     
     const insertAccount = db.prepare(`
