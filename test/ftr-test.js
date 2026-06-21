@@ -281,7 +281,7 @@ function runFTRModuleTest() {
   console.log(`  ✓ 拍卖编号: ${auction.auction_no}`);
   console.log(`    方向: ${zoneA.code} → ${zoneB.code}`);
   console.log(`    总容量: ${auction.total_capacity_mw}MW (联络线80%容量上限: ${tieLine.max_transfer_capacity * 0.8}MW)`);
-  console.log(`    单主体上限: 30% = ${auction.total_capacity_mw * 0.3}MW`);
+  console.log(`    单主体上限: 30%×联络线总容量 = ${tieLine.max_transfer_capacity * 0.3}MW`);
   console.log(`    状态: ${auction.status}`);
 
   assertApprox(auction.total_capacity_mw, 70);
@@ -289,7 +289,7 @@ function runFTRModuleTest() {
 
   logStep(2, '提交FTR竞拍报价');
 
-  const maxPerPerson = 70 * 0.3;
+  const maxPerPerson = tieLine.max_transfer_capacity * 0.3;
 
   const bid1 = ftrService.submitBid(auction.id, conB1.id, 25, 15);
   console.log(`  ✓ ${conB1.code} 报价: ${bid1.bid_capacity_mw}MW @ ${bid1.bid_price}元/MW·月`);
@@ -549,8 +549,8 @@ function runFTRModuleTest() {
     total_capacity_mw: 80
   });
 
-  const maxCap = 80 * 0.3;
-  console.log(`  ✓ 开启拍卖2 (${testMonthNext}): 总容量80MW, 单人上限${maxCap.toFixed(1)}MW`);
+  const maxCap = tieLine.max_transfer_capacity * 0.3;
+  console.log(`  ✓ 开启拍卖2 (${testMonthNext}): 总容量80MW, 单人上限30%×联络线=${maxCap.toFixed(1)}MW`);
 
   ftrService.submitBid(auction2.id, conB1.id, maxCap + 20, 25);
   console.log(`  ✓ ${conB1.code} 报价: ${maxCap + 20}MW @ 25元 (报价超单人上限, 出清时将被截断至${maxCap}MW)`);
@@ -563,16 +563,21 @@ function runFTRModuleTest() {
 
   const cleared2 = ftrService.executeAuctionClearing(auction2.id);
   console.log(`  ✓ 拍卖2出清完成: 出清价${cleared2.clearing_price}元, 总出清${cleared2.total_cleared_capacity_mw}MW`);
+  console.log(`    验证统一出清价付款: 所有中标者按出清价${cleared2.clearing_price}元/MW·月付款`);
 
   for (const bid of cleared2.bids) {
     if (bid.cleared_capacity_mw > 0) {
-      console.log(`    ${bid.participant_code}: 报价${bid.bid_capacity_mw}MW → 中标${bid.cleared_capacity_mw}MW (上限${maxCap}MW)`);
+      const expectedPayment = bid.cleared_capacity_mw * cleared2.clearing_price;
+      assertApprox(bid.payment_amount, expectedPayment, 0.01, `${bid.participant_code}付款应为中标容量×统一出清价`);
+      console.log(`    ${bid.participant_code}: 报价${bid.bid_capacity_mw}MW @ ${bid.bid_price}元 → 中标${bid.cleared_capacity_mw}MW`
+        + ` 付款${bid.payment_amount}元 (= ${bid.cleared_capacity_mw}×${cleared2.clearing_price}) [${bid.status}]`);
       if (bid.participant_id === conB1.id) {
         assertApprox(bid.cleared_capacity_mw, maxCap, 0.01, `${bid.participant_code}应被截断到单人上限`);
       }
     }
   }
   console.log(`  ✓ 校验: ${conB1.code}中标${cleared2.bids.find(b=>b.participant_id===conB1.id).cleared_capacity_mw}MW = 单人上限${maxCap}MW (截断正确)`);
+  console.log(`  ✓ 校验: 统一出清价付款机制正确`);
 
   logStep(14, '验证边界条件: 拍卖容量上限约束');
 

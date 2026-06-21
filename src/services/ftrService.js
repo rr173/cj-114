@@ -227,6 +227,9 @@ function executeAuctionClearing(auctionId) {
     throw new Error('拍卖状态不允许出清');
   }
 
+  const tieLine = getTieLineById(auction.tie_line_id);
+  const maxPerParticipant = tieLine.max_transfer_capacity * auction.max_single_participant_ratio;
+
   const tx = db.transaction(() => {
     db.prepare(`UPDATE ftr_auctions SET status = 'closed' WHERE id = ?`).run(auctionId);
 
@@ -237,13 +240,11 @@ function executeAuctionClearing(auctionId) {
     `).all(auctionId);
 
     let remainingCapacity = auction.total_capacity_mw;
-    const maxPerParticipant = auction.total_capacity_mw * auction.max_single_participant_ratio;
     const participantAllocated = {};
-    let clearingPrice = 0;
+    let marginalPrice = 0;
     let totalCleared = 0;
 
-    const clearedBids = [];
-    const rejectedBids = [];
+    const bidResults = [];
 
     for (const bid of validBids) {
       const pid = bid.participant_id;
@@ -256,32 +257,42 @@ function executeAuctionClearing(auctionId) {
       );
 
       if (canAllocate <= 0) {
-        rejectedBids.push({ ...bid, cleared_capacity_mw: 0 });
+        bidResults.push({ ...bid, cleared_capacity_mw: 0, status: 'rejected' });
         continue;
       }
 
-      clearingPrice = bid.bid_price;
+      marginalPrice = bid.bid_price;
       participantAllocated[pid] += canAllocate;
       remainingCapacity -= canAllocate;
       totalCleared += canAllocate;
 
       const isPartial = canAllocate < bid.bid_capacity_mw;
-      clearedBids.push({
+      bidResults.push({
         ...bid,
         cleared_capacity_mw: canAllocate,
-        clearing_price: clearingPrice,
-        payment_amount: canAllocate * clearingPrice,
         status: isPartial ? 'partial' : 'accepted'
       });
 
       if (remainingCapacity <= 0) break;
     }
 
-    const notCleared = validBids.filter(
-      b => !clearedBids.find(cb => cb.id === b.id) && !rejectedBids.find(rb => rb.id === b.id)
-    );
-    for (const bid of notCleared) {
-      rejectedBids.push({ ...bid, cleared_capacity_mw: 0 });
+    const processedIds = new Set(bidResults.map(b => b.id));
+    for (const bid of validBids) {
+      if (!processedIds.has(bid.id)) {
+        bidResults.push({ ...bid, cleared_capacity_mw: 0, status: 'rejected' });
+      }
+    }
+
+    const finalClearingPrice = totalCleared > 0 ? marginalPrice : 0;
+
+    for (const result of bidResults) {
+      if (result.cleared_capacity_mw > 0) {
+        result.clearing_price = finalClearingPrice;
+        result.payment_amount = result.cleared_capacity_mw * finalClearingPrice;
+      } else {
+        result.clearing_price = null;
+        result.payment_amount = 0;
+      }
     }
 
     const updateBidStmt = db.prepare(`
@@ -298,40 +309,36 @@ function executeAuctionClearing(auctionId) {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
     `);
 
-    for (const bid of clearedBids) {
+    for (const result of bidResults) {
       updateBidStmt.run(
-        bid.status,
-        bid.cleared_capacity_mw,
-        bid.clearing_price,
-        bid.payment_amount,
-        bid.id
+        result.status,
+        result.cleared_capacity_mw,
+        result.clearing_price,
+        result.payment_amount,
+        result.id
       );
-      if (bid.cleared_capacity_mw > 0) {
+      if (result.cleared_capacity_mw > 0) {
         insertHoldingStmt.run(
           uuidv4(),
           auctionId,
-          bid.id,
-          bid.participant_id,
+          result.id,
+          result.participant_id,
           auction.month,
           auction.tie_line_id,
           auction.direction_zone_from,
           auction.direction_zone_to,
-          bid.cleared_capacity_mw,
-          bid.clearing_price,
-          bid.payment_amount
+          result.cleared_capacity_mw,
+          result.clearing_price,
+          result.payment_amount
         );
       }
-    }
-
-    for (const bid of rejectedBids) {
-      updateBidStmt.run('rejected', 0, null, 0, bid.id);
     }
 
     db.prepare(`
       UPDATE ftr_auctions 
       SET status = 'cleared', clearing_price = ?, total_cleared_capacity_mw = ?
       WHERE id = ?
-    `).run(totalCleared > 0 ? clearingPrice : 0, totalCleared, auctionId);
+    `).run(finalClearingPrice, totalCleared, auctionId);
   });
 
   tx();
