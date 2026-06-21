@@ -5,6 +5,7 @@ const { listParticipants, getParticipantById } = require('./participantService')
 const { decomposeContractsForDate, getDecompositionByDate } = require('./contractService');
 const { getParticipantZone, listPriceZones } = require('./priceZoneService');
 const { getIntradayNetVolumes } = require('./intradayService');
+const { unfreezeMargin, penalizeDeviation } = require('./marginService');
 
 const POSITIVE_DEVIATION_RATIO = 0.8;
 const NEGATIVE_DEVIATION_RATIO = 1.2;
@@ -433,7 +434,28 @@ function executeSettlement(tradingDayId) {
 
   tx();
 
-  return getSettlementByTradingDay(tradingDayId);
+  const marginResults = [];
+  const penaltyResults = [];
+  const participantIds = Array.from(allPartIds);
+  
+  for (const pid of participantIds) {
+    const unfreezeResult = unfreezeMargin(pid, tradingDayId);
+    if (unfreezeResult) {
+      marginResults.push(unfreezeResult);
+    }
+    
+    const penaltyResult = penalizeDeviation(pid, tradingDayId);
+    if (penaltyResult) {
+      penaltyResults.push(penaltyResult);
+    }
+  }
+
+  const settlementResult = getSettlementByTradingDay(tradingDayId);
+  return {
+    ...settlementResult,
+    margin_unfreeze: marginResults,
+    deviation_penalties: penaltyResults
+  };
 }
 
 function _buildSettlementResponse(tradingDayId, rows, td) {

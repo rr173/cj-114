@@ -821,6 +821,80 @@ function initDatabase() {
       FOREIGN KEY (participant_id) REFERENCES market_participants(id),
       UNIQUE(report_id, participant_id)
     );
+
+    CREATE TABLE IF NOT EXISTS credit_scores (
+      id TEXT PRIMARY KEY,
+      participant_id TEXT NOT NULL,
+      month TEXT NOT NULL,
+      score REAL NOT NULL DEFAULT 70,
+      level TEXT NOT NULL DEFAULT 'A',
+      settlement_timeliness REAL NOT NULL DEFAULT 0,
+      settlement_timeliness_score REAL NOT NULL DEFAULT 0,
+      deviation_control REAL NOT NULL DEFAULT 0,
+      deviation_control_score REAL NOT NULL DEFAULT 0,
+      contract_performance REAL NOT NULL DEFAULT 0,
+      contract_performance_score REAL NOT NULL DEFAULT 0,
+      violation_count INTEGER NOT NULL DEFAULT 0,
+      violation_score REAL NOT NULL DEFAULT 0,
+      trading_restricted INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (participant_id) REFERENCES market_participants(id),
+      UNIQUE(participant_id, month)
+    );
+
+    CREATE TABLE IF NOT EXISTS credit_margin_accounts (
+      id TEXT PRIMARY KEY,
+      participant_id TEXT NOT NULL UNIQUE,
+      balance REAL NOT NULL DEFAULT 0,
+      frozen_amount REAL NOT NULL DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (participant_id) REFERENCES market_participants(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS credit_margin_transactions (
+      id TEXT PRIMARY KEY,
+      account_id TEXT NOT NULL,
+      participant_id TEXT NOT NULL,
+      transaction_type TEXT NOT NULL CHECK(transaction_type IN ('deposit', 'freeze', 'unfreeze', 'penalty', 'adjustment')),
+      amount REAL NOT NULL,
+      balance_after REAL NOT NULL,
+      frozen_after REAL NOT NULL,
+      reference_type TEXT,
+      reference_id TEXT,
+      description TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (account_id) REFERENCES credit_margin_accounts(id),
+      FOREIGN KEY (participant_id) REFERENCES market_participants(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS credit_margin_freezes (
+      id TEXT PRIMARY KEY,
+      account_id TEXT NOT NULL,
+      participant_id TEXT NOT NULL,
+      trading_day_id TEXT NOT NULL,
+      amount REAL NOT NULL,
+      status TEXT NOT NULL DEFAULT 'frozen' CHECK(status IN ('frozen', 'unfrozen', 'penalized')),
+      penalty_amount REAL DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now')),
+      unfrozen_at TEXT,
+      FOREIGN KEY (account_id) REFERENCES credit_margin_accounts(id),
+      FOREIGN KEY (participant_id) REFERENCES market_participants(id),
+      FOREIGN KEY (trading_day_id) REFERENCES trading_days(id),
+      UNIQUE(participant_id, trading_day_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS credit_adjustment_records (
+      id TEXT PRIMARY KEY,
+      participant_id TEXT NOT NULL,
+      month TEXT NOT NULL,
+      original_score REAL NOT NULL,
+      adjusted_score REAL NOT NULL,
+      adjustment_reason TEXT NOT NULL,
+      operator TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (participant_id) REFERENCES market_participants(id)
+    );
   `);
 }
 
@@ -831,6 +905,37 @@ try { db.exec(`ALTER TABLE trading_days ADD COLUMN reserve_demand REAL`); } catc
 try { db.exec(`ALTER TABLE settlement_details ADD COLUMN exempt_amount REAL DEFAULT 0`); } catch (e) {}
 try { db.exec(`ALTER TABLE clearing_results ADD COLUMN clearing_type TEXT DEFAULT 'unified' CHECK(clearing_type IN ('unified', 'zoned'))`); } catch (e) {}
 try { db.exec(`ALTER TABLE market_participants ADD COLUMN energy_type TEXT`); } catch (e) {}
+
+try {
+  const initCreditData = db.transaction(() => {
+    const participants = db.prepare(`SELECT id FROM market_participants`).all();
+    const currentMonth = new Date().toISOString().slice(0, 7);
+    
+    const insertScore = db.prepare(`
+      INSERT OR IGNORE INTO credit_scores 
+      (id, participant_id, month, score, level, settlement_timeliness, settlement_timeliness_score,
+       deviation_control, deviation_control_score, contract_performance, contract_performance_score,
+       violation_count, violation_score, trading_restricted)
+      VALUES (?, ?, ?, 70, 'A', 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    `);
+    
+    const insertAccount = db.prepare(`
+      INSERT OR IGNORE INTO credit_margin_accounts 
+      (id, participant_id, balance, frozen_amount)
+      VALUES (?, ?, 0, 0)
+    `);
+    
+    const { v4: uuidv4 } = require('uuid');
+    for (const p of participants) {
+      insertScore.run(uuidv4(), p.id, currentMonth);
+      insertAccount.run(uuidv4(), p.id);
+    }
+  });
+  initCreditData();
+  console.log('[DB Migration] 信用数据初始化完成');
+} catch (e) {
+  console.log('[DB Migration] 信用数据初始化跳过:', e.message);
+}
 
 try {
   const migrateGcSource = db.transaction(() => {

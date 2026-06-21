@@ -2,6 +2,8 @@ const { v4: uuidv4 } = require('uuid');
 const db = require('../utils/db');
 const { getTradingDayById, isBiddingOpen } = require('./tradingDayService');
 const { getParticipantById } = require('./participantService');
+const { isTradingRestricted, getTradingLimitRatio } = require('./creditService');
+const { freezeMargin } = require('./marginService');
 
 function submitGeneratorBid(tradingDayId, participantId, bids) {
   const td = getTradingDayById(tradingDayId);
@@ -20,9 +22,16 @@ function submitGeneratorBid(tradingDayId, participantId, bids) {
     throw new Error('该主体不是发电侧，不能提交发电报价');
   }
 
+  if (isTradingRestricted(participantId)) {
+    throw new Error('信用不足，交易已被限制，请联系管理员');
+  }
+
   if (!Array.isArray(bids) || bids.length === 0) {
     throw new Error('报价数据不能为空');
   }
+
+  const limitRatio = getTradingLimitRatio(participantId);
+  const maxCapacity = participant.installed_capacity * limitRatio;
 
   const grouped = {};
   for (const bid of bids) {
@@ -44,11 +53,17 @@ function submitGeneratorBid(tradingDayId, participantId, bids) {
       }
       totalCapacity += seg.capacity;
     }
-    if (totalCapacity > participant.installed_capacity) {
-      throw new Error(`时段 ${hour} 报价总容量超过装机容量`);
+    if (totalCapacity > maxCapacity) {
+      if (limitRatio < 1) {
+        throw new Error(`时段 ${hour} 报价总容量超过信用限额 ${maxCapacity} MW（当前信用等级B，限额为装机容量的80%）`);
+      } else {
+        throw new Error(`时段 ${hour} 报价总容量超过装机容量`);
+      }
     }
     grouped[hour] = segments;
   }
+
+  const marginResult = freezeMargin(participantId, tradingDayId, bids);
 
   const tx = db.transaction(() => {
     const deleteStmt = db.prepare(`
@@ -79,7 +94,11 @@ function submitGeneratorBid(tradingDayId, participantId, bids) {
 
   tx();
 
-  return getGeneratorBids(tradingDayId, participantId);
+  const result = getGeneratorBids(tradingDayId, participantId);
+  return {
+    bids: result,
+    margin_info: marginResult
+  };
 }
 
 function submitConsumerBid(tradingDayId, participantId, bids) {
@@ -99,9 +118,16 @@ function submitConsumerBid(tradingDayId, participantId, bids) {
     throw new Error('该主体不是用电侧，不能提交用电报价');
   }
 
+  if (isTradingRestricted(participantId)) {
+    throw new Error('信用不足，交易已被限制，请联系管理员');
+  }
+
   if (!Array.isArray(bids) || bids.length === 0) {
     throw new Error('报价数据不能为空');
   }
+
+  const limitRatio = getTradingLimitRatio(participantId);
+  const maxCapacity = participant.contracted_capacity * limitRatio;
 
   for (const bid of bids) {
     const { hour, demand, max_price } = bid;
@@ -114,10 +140,16 @@ function submitConsumerBid(tradingDayId, participantId, bids) {
     if (max_price == null || max_price < 0) {
       throw new Error(`时段 ${hour} 最高可接受电价无效`);
     }
-    if (demand > participant.contracted_capacity) {
-      throw new Error(`时段 ${hour} 需求量超过签约容量`);
+    if (demand > maxCapacity) {
+      if (limitRatio < 1) {
+        throw new Error(`时段 ${hour} 需求量超过信用限额 ${maxCapacity} MW（当前信用等级B，限额为签约容量的80%）`);
+      } else {
+        throw new Error(`时段 ${hour} 需求量超过签约容量`);
+      }
     }
   }
+
+  const marginResult = freezeMargin(participantId, tradingDayId, bids);
 
   const tx = db.transaction(() => {
     const deleteStmt = db.prepare(`
@@ -144,7 +176,11 @@ function submitConsumerBid(tradingDayId, participantId, bids) {
 
   tx();
 
-  return getConsumerBids(tradingDayId, participantId);
+  const result = getConsumerBids(tradingDayId, participantId);
+  return {
+    bids: result,
+    margin_info: marginResult
+  };
 }
 
 function getGeneratorBids(tradingDayId, participantId) {

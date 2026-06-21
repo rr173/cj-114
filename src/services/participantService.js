@@ -3,6 +3,7 @@ const db = require('../utils/db');
 
 const RENEWABLE_ENERGY_TYPES = ['wind', 'solar', 'hydro', 'biomass', 'geothermal'];
 const ALL_ENERGY_TYPES = [...RENEWABLE_ENERGY_TYPES, 'thermal', 'nuclear', 'other'];
+const INITIAL_CREDIT_SCORE = 70;
 
 function registerParticipant(data) {
   const { code, name, type, installed_capacity, min_output, ramp_rate, contracted_capacity, energy_type } = data;
@@ -25,31 +26,54 @@ function registerParticipant(data) {
   }
 
   const id = uuidv4();
+  const currentMonth = new Date().toISOString().slice(0, 7);
 
-  if (type === 'generator') {
-    if (installed_capacity == null || min_output == null || ramp_rate == null) {
-      throw new Error('发电侧需填写装机容量、最小出力、爬坡速率');
+  const tx = db.transaction(() => {
+    if (type === 'generator') {
+      if (installed_capacity == null || min_output == null || ramp_rate == null) {
+        throw new Error('发电侧需填写装机容量、最小出力、爬坡速率');
+      }
+      if (min_output >= installed_capacity) {
+        throw new Error('最小出力必须小于装机容量');
+      }
+      const stmt = db.prepare(`
+        INSERT INTO market_participants 
+        (id, code, name, type, installed_capacity, min_output, ramp_rate, contracted_capacity, energy_type)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      stmt.run(id, code, name, type, installed_capacity, min_output, ramp_rate, null, energy_type || 'thermal');
+    } else {
+      if (contracted_capacity == null) {
+        throw new Error('用电侧需填写签约用户总容量');
+      }
+      const stmt = db.prepare(`
+        INSERT INTO market_participants 
+        (id, code, name, type, installed_capacity, min_output, ramp_rate, contracted_capacity)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      stmt.run(id, code, name, type, null, null, null, contracted_capacity);
     }
-    if (min_output >= installed_capacity) {
-      throw new Error('最小出力必须小于装机容量');
-    }
-    const stmt = db.prepare(`
-      INSERT INTO market_participants 
-      (id, code, name, type, installed_capacity, min_output, ramp_rate, contracted_capacity, energy_type)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    stmt.run(id, code, name, type, installed_capacity, min_output, ramp_rate, null, energy_type || 'thermal');
-  } else {
-    if (contracted_capacity == null) {
-      throw new Error('用电侧需填写签约用户总容量');
-    }
-    const stmt = db.prepare(`
-      INSERT INTO market_participants 
-      (id, code, name, type, installed_capacity, min_output, ramp_rate, contracted_capacity)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    stmt.run(id, code, name, type, null, null, null, contracted_capacity);
-  }
+
+    const initialLevel = INITIAL_CREDIT_SCORE >= 90 ? 'AAA' : 
+                         INITIAL_CREDIT_SCORE >= 75 ? 'AA' : 
+                         INITIAL_CREDIT_SCORE >= 60 ? 'A' : 'B';
+    
+    db.prepare(`
+      INSERT INTO credit_scores 
+      (id, participant_id, month, score, level, settlement_timeliness, settlement_timeliness_score,
+       deviation_control, deviation_control_score, contract_performance, contract_performance_score,
+       violation_count, violation_score, trading_restricted)
+      VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    `).run(uuidv4(), id, currentMonth, INITIAL_CREDIT_SCORE, initialLevel);
+
+    db.prepare(`
+      INSERT INTO credit_margin_accounts 
+      (id, participant_id, balance, frozen_amount)
+      VALUES (?, ?, 0, 0)
+    `).run(uuidv4(), id);
+  });
+
+  tx();
 
   return getParticipantById(id);
 }

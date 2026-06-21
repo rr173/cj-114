@@ -15,6 +15,7 @@ const greenCertificatesRouter = require('./routes/greenCertificates');
 const capacityMarketRouter = require('./routes/capacityMarket');
 const settlementDisputesRouter = require('./routes/settlementDisputes');
 const ftrRouter = require('./routes/ftr');
+const creditRouter = require('./routes/creditRoutes');
 
 const app = express();
 
@@ -35,6 +36,7 @@ app.use('/api/green-certificates', greenCertificatesRouter);
 app.use('/api/capacity-market', capacityMarketRouter);
 app.use('/api/settlement-disputes', settlementDisputesRouter);
 app.use('/api/ftr', ftrRouter);
+app.use('/api/credit', creditRouter);
 
 app.get('/api/health', (req, res) => {
   res.json({
