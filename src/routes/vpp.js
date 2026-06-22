@@ -306,4 +306,83 @@ router.get('/resources/:id/revenue-allocations', (req, res) => {
   }
 });
 
+router.get('/aggregators/:id/real-time-margin', (req, res) => {
+  try {
+    const { trading_day_id, hour } = req.query;
+    const result = vppService.calculateRealTimeAdjustableMargin(
+      req.params.id, trading_day_id, parseInt(hour)
+    );
+    res.json({ success: true, data: result });
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+router.post('/aggregators/:id/real-time-command', (req, res) => {
+  try {
+    const { trading_day_id, hour, target_adjustment_mw, response_time_seconds } = req.body;
+    const result = vppService.submitRealTimeCommand(
+      req.params.id, trading_day_id, parseInt(hour),
+      target_adjustment_mw, parseInt(response_time_seconds)
+    );
+    res.json({ success: true, data: result });
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+router.get('/aggregators/:id/real-time-commands', (req, res) => {
+  try {
+    const { trading_day_id } = req.query;
+    const result = vppService.getRealTimeCommands(req.params.id, trading_day_id);
+    res.json({ success: true, data: result });
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+router.get('/real-time-commands/:commandId', (req, res) => {
+  try {
+    const result = vppService.getRealTimeCommandDetail(req.params.commandId);
+    if (!result) {
+      return res.status(404).json({ success: false, error: '指令不存在' });
+    }
+    res.json({ success: true, data: result });
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+router.get('/resources/:id/real-time-history', (req, res) => {
+  try {
+    const { trading_day_id } = req.query;
+    const result = vppService.getResourceRealTimeHistory(req.params.id, trading_day_id);
+    res.json({ success: true, data: result });
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+router.get('/aggregators/:id/cumulative-adjustment', (req, res) => {
+  try {
+    const { trading_day_id, hour } = req.query;
+    const result = vppService.getCumulativeAdjustment(
+      req.params.id, trading_day_id, parseInt(hour)
+    );
+    res.json({ success: true, data: result });
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+router.get('/aggregators/:id/cumulative-adjustments', (req, res) => {
+  try {
+    const { trading_day_id } = req.query;
+    const result = vppService.getHourlyCumulativeAdjustments(req.params.id, trading_day_id);
+    res.json({ success: true, data: result });
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
 module.exports = router;

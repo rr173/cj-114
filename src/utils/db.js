@@ -1002,6 +1002,7 @@ function initDatabase() {
       aggregator_id TEXT NOT NULL,
       type TEXT NOT NULL CHECK(type IN ('storage', 'interruptible_load', 'solar_pv', 'charging_pile')),
       rated_power_kw REAL NOT NULL,
+      ramp_rate_kw_per_min REAL NOT NULL DEFAULT 0,
       is_reliable INTEGER NOT NULL DEFAULT 1,
       owner_name TEXT,
       created_at TEXT DEFAULT (datetime('now')),
@@ -1045,12 +1046,47 @@ function initDatabase() {
       hour INTEGER NOT NULL CHECK(hour BETWEEN 0 AND 23),
       resource_id TEXT NOT NULL,
       bid_id TEXT,
+      real_time_command_id TEXT,
       allocated_output_kw REAL NOT NULL,
+      is_real_time_adjustment INTEGER NOT NULL DEFAULT 0,
       created_at TEXT DEFAULT (datetime('now')),
       FOREIGN KEY (aggregator_id) REFERENCES vpp_aggregators(id),
       FOREIGN KEY (trading_day_id) REFERENCES trading_days(id),
       FOREIGN KEY (resource_id) REFERENCES vpp_resources(id),
-      FOREIGN KEY (bid_id) REFERENCES vpp_bids(id)
+      FOREIGN KEY (bid_id) REFERENCES vpp_bids(id),
+      FOREIGN KEY (real_time_command_id) REFERENCES vpp_real_time_commands(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS vpp_real_time_commands (
+      id TEXT PRIMARY KEY,
+      aggregator_id TEXT NOT NULL,
+      trading_day_id TEXT NOT NULL,
+      hour INTEGER NOT NULL CHECK(hour BETWEEN 0 AND 23),
+      target_adjustment_mw REAL NOT NULL,
+      response_time_seconds INTEGER NOT NULL,
+      actual_responsive_mw REAL NOT NULL DEFAULT 0,
+      unresponsive_mw REAL NOT NULL DEFAULT 0,
+      response_rate REAL NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'processed' CHECK(status IN ('pending', 'processed', 'failed')),
+      failure_reason TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (aggregator_id) REFERENCES vpp_aggregators(id),
+      FOREIGN KEY (trading_day_id) REFERENCES trading_days(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS vpp_real_time_command_details (
+      id TEXT PRIMARY KEY,
+      command_id TEXT NOT NULL,
+      resource_id TEXT NOT NULL,
+      original_allocated_kw REAL NOT NULL,
+      adjustment_kw REAL NOT NULL,
+      final_allocated_kw REAL NOT NULL,
+      max_ramp_capacity_kw REAL NOT NULL,
+      adjustable_margin_kw REAL NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (command_id) REFERENCES vpp_real_time_commands(id) ON DELETE CASCADE,
+      FOREIGN KEY (resource_id) REFERENCES vpp_resources(id),
+      UNIQUE(command_id, resource_id)
     );
 
     CREATE TABLE IF NOT EXISTS vpp_actual_outputs (
@@ -1104,6 +1140,8 @@ function initDatabase() {
       aggregator_id TEXT NOT NULL,
       trading_day_id TEXT NOT NULL,
       total_cleared_energy_mwh REAL NOT NULL DEFAULT 0,
+      total_real_time_adjustment_mwh REAL NOT NULL DEFAULT 0,
+      total_target_energy_mwh REAL NOT NULL DEFAULT 0,
       total_actual_energy_mwh REAL NOT NULL DEFAULT 0,
       deviation_energy_mwh REAL NOT NULL DEFAULT 0,
       deviation_rate REAL NOT NULL DEFAULT 0,
@@ -1147,6 +1185,11 @@ try { db.exec(`ALTER TABLE credit_scores ADD COLUMN manually_adjusted INTEGER NO
 try { db.exec(`ALTER TABLE vpp_performance_records ADD COLUMN raw_actual_output_kw REAL`); } catch (e) {}
 try { db.exec(`ALTER TABLE vpp_performance_records ADD COLUMN redistributed_amount_kw REAL DEFAULT 0`); } catch (e) {}
 try { db.exec(`ALTER TABLE vpp_performance_records ADD COLUMN redistributed_to_deficit_kw REAL DEFAULT 0`); } catch (e) {}
+try { db.exec(`ALTER TABLE vpp_resources ADD COLUMN ramp_rate_kw_per_min REAL NOT NULL DEFAULT 0`); } catch (e) {}
+try { db.exec(`ALTER TABLE vpp_output_distributions ADD COLUMN real_time_command_id TEXT`); } catch (e) {}
+try { db.exec(`ALTER TABLE vpp_output_distributions ADD COLUMN is_real_time_adjustment INTEGER NOT NULL DEFAULT 0`); } catch (e) {}
+try { db.exec(`ALTER TABLE vpp_settlements ADD COLUMN total_real_time_adjustment_mwh REAL NOT NULL DEFAULT 0`); } catch (e) {}
+try { db.exec(`ALTER TABLE vpp_settlements ADD COLUMN total_target_energy_mwh REAL NOT NULL DEFAULT 0`); } catch (e) {}
 
 try {
   const initCreditData = db.transaction(() => {

@@ -139,7 +139,7 @@ function listAggregators() {
 }
 
 function registerResource(data) {
-  const { code, name, aggregator_id, type, rated_power_kw, owner_name } = data;
+  const { code, name, aggregator_id, type, rated_power_kw, ramp_rate_kw_per_min, owner_name } = data;
 
   if (!code || !name || !aggregator_id || !type || rated_power_kw == null) {
     throw new Error('资源编码、名称、所属聚合商、类型、额定功率为必填项');
@@ -153,6 +153,10 @@ function registerResource(data) {
     throw new Error('额定功率必须大于0');
   }
 
+  if (ramp_rate_kw_per_min != null && ramp_rate_kw_per_min < 0) {
+    throw new Error('爬坡速率不能为负数');
+  }
+
   const aggregator = getAggregatorById(aggregator_id);
   if (!aggregator) {
     throw new Error('所属聚合商不存在');
@@ -163,11 +167,12 @@ function registerResource(data) {
     throw new Error('资源编码已存在');
   }
 
+  const rampRate = ramp_rate_kw_per_min != null ? ramp_rate_kw_per_min : 0;
   const id = uuidv4();
   db.prepare(`
-    INSERT INTO vpp_resources (id, code, name, aggregator_id, type, rated_power_kw, owner_name)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(id, code, name, aggregator_id, type, rated_power_kw, owner_name);
+    INSERT INTO vpp_resources (id, code, name, aggregator_id, type, rated_power_kw, ramp_rate_kw_per_min, owner_name)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, code, name, aggregator_id, type, rated_power_kw, rampRate, owner_name);
 
   return getResourceById(id);
 }
@@ -498,9 +503,16 @@ function distributeOutput(aggregatorId, tradingDayId, hour, totalOutputKw) {
 function getOutputDistribution(aggregatorId, tradingDayId) {
   const rows = db.prepare(`
     SELECT d.*, r.code as resource_code, r.name as resource_name, r.type
-    FROM vpp_output_distributions d
+    FROM (
+      SELECT *, ROW_NUMBER() OVER (
+        PARTITION BY resource_id, hour
+        ORDER BY is_real_time_adjustment DESC, created_at DESC, id DESC
+      ) as rn
+      FROM vpp_output_distributions
+      WHERE aggregator_id = ? AND trading_day_id = ?
+    ) d
     LEFT JOIN vpp_resources r ON d.resource_id = r.id
-    WHERE d.aggregator_id = ? AND d.trading_day_id = ?
+    WHERE d.rn = 1
     ORDER BY d.hour, r.code
   `).all(aggregatorId, tradingDayId);
 
@@ -516,7 +528,9 @@ function getOutputDistribution(aggregatorId, tradingDayId) {
       resource_name: r.resource_name,
       type: r.type,
       type_label: RESOURCE_TYPE_LABELS[r.type],
-      allocated_output_kw: r.allocated_output_kw
+      allocated_output_kw: r.allocated_output_kw,
+      is_real_time_adjustment: r.is_real_time_adjustment,
+      real_time_command_id: r.real_time_command_id
     });
   }
 
@@ -530,9 +544,16 @@ function getOutputDistribution(aggregatorId, tradingDayId) {
 function getResourceOutputDistribution(resourceId, tradingDayId) {
   return db.prepare(`
     SELECT d.*, r.code as resource_code, r.name as resource_name
-    FROM vpp_output_distributions d
+    FROM (
+      SELECT *, ROW_NUMBER() OVER (
+        PARTITION BY resource_id, hour
+        ORDER BY is_real_time_adjustment DESC, created_at DESC, id DESC
+      ) as rn
+      FROM vpp_output_distributions
+      WHERE resource_id = ? AND trading_day_id = ?
+    ) d
     LEFT JOIN vpp_resources r ON d.resource_id = r.id
-    WHERE d.resource_id = ? AND d.trading_day_id = ?
+    WHERE d.rn = 1
     ORDER BY d.hour
   `).all(resourceId, tradingDayId);
 }
@@ -999,6 +1020,8 @@ function executeVppSettlement(aggregatorId, tradingDayId, marketData) {
   const deviationPenaltyRate = marketData && marketData.deviation_penalty_rate != null ? marketData.deviation_penalty_rate : 1.5;
 
   let totalClearedEnergyMwh = 0;
+  let totalRealTimeAdjustmentMwh = 0;
+  let totalTargetEnergyMwh = 0;
   let totalActualEnergyMwh = 0;
   let totalSpotRevenue = 0;
   let totalDeviation = 0;
@@ -1007,6 +1030,15 @@ function executeVppSettlement(aggregatorId, tradingDayId, marketData) {
   const bidMap = {};
   for (const b of bids.bids) bidMap[b.hour] = b;
 
+  const realTimeCommands = db.prepare(`
+    SELECT hour, SUM(actual_responsive_mw) as total_adjustment_mw
+    FROM vpp_real_time_commands
+    WHERE aggregator_id = ? AND trading_day_id = ?
+    GROUP BY hour
+  `).all(aggregatorId, tradingDayId);
+  const realTimeAdjustmentMap = {};
+  for (const c of realTimeCommands) realTimeAdjustmentMap[c.hour] = c.total_adjustment_mw;
+
   const resourceContribution = {};
   const resources = listResourcesByAggregator(aggregatorId);
   for (const r of resources) resourceContribution[r.id] = 0;
@@ -1014,8 +1046,12 @@ function executeVppSettlement(aggregatorId, tradingDayId, marketData) {
   for (let h = 0; h < 24; h++) {
     const bid = bidMap[h];
     const clearedMw = bid ? bid.cleared_capacity_mw : 0;
+    const realTimeAdjMw = realTimeAdjustmentMap[h] || 0;
+    const targetMw = clearedMw + realTimeAdjMw;
     const clearedEnergy = clearedMw;
     totalClearedEnergyMwh += clearedEnergy;
+    totalRealTimeAdjustmentMwh += realTimeAdjMw;
+    totalTargetEnergyMwh += targetMw;
 
     const hourActual = actuals.hourly_actuals.find(x => x.hour === h);
     const actualKw = hourActual ? hourActual.total_actual_kw : 0;
@@ -1025,7 +1061,7 @@ function executeVppSettlement(aggregatorId, tradingDayId, marketData) {
     const clearingPrice = clearingPrices[h] != null ? clearingPrices[h] : (bid ? bid.clearing_price : 0);
     totalSpotRevenue += clearedEnergy * clearingPrice;
 
-    const dev = actualMw - clearedEnergy;
+    const dev = actualMw - targetMw;
     totalDeviation += Math.abs(dev);
 
     if (hourActual) {
@@ -1035,7 +1071,7 @@ function executeVppSettlement(aggregatorId, tradingDayId, marketData) {
     }
   }
 
-  const totalEnergyForPenalty = totalActualEnergyMwh - totalClearedEnergyMwh;
+  const totalEnergyForPenalty = totalActualEnergyMwh - totalTargetEnergyMwh;
   const avgPrice = totalClearedEnergyMwh > 0 ? totalSpotRevenue / totalClearedEnergyMwh : 300;
   const deviationPenalty = Math.abs(totalEnergyForPenalty) * avgPrice * deviationPenaltyRate;
 
@@ -1046,18 +1082,30 @@ function executeVppSettlement(aggregatorId, tradingDayId, marketData) {
   const settlementId = uuidv4();
 
   const tx = db.transaction(() => {
+    const existing = db.prepare(`
+      SELECT id FROM vpp_settlements WHERE aggregator_id = ? AND trading_day_id = ?
+    `).get(aggregatorId, tradingDayId);
+
+    if (existing) {
+      db.prepare(`DELETE FROM vpp_revenue_allocations WHERE settlement_id = ?`).run(existing.id);
+      db.prepare(`DELETE FROM vpp_settlements WHERE id = ?`).run(existing.id);
+    }
+
     db.prepare(`
       INSERT INTO vpp_settlements
-      (id, aggregator_id, trading_day_id, total_cleared_energy_mwh, total_actual_energy_mwh,
+      (id, aggregator_id, trading_day_id, total_cleared_energy_mwh, total_real_time_adjustment_mwh,
+       total_target_energy_mwh, total_actual_energy_mwh,
        deviation_energy_mwh, deviation_rate, spot_revenue_yuan, deviation_penalty_yuan,
        total_revenue_yuan, service_fee_yuan, distributable_revenue_yuan)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       settlementId, aggregatorId, tradingDayId,
       Math.round(totalClearedEnergyMwh * 10000) / 10000,
+      Math.round(totalRealTimeAdjustmentMwh * 10000) / 10000,
+      Math.round(totalTargetEnergyMwh * 10000) / 10000,
       Math.round(totalActualEnergyMwh * 10000) / 10000,
       Math.round(totalEnergyForPenalty * 10000) / 10000,
-      totalClearedEnergyMwh > 0 ? Math.round(Math.abs(totalEnergyForPenalty) / totalClearedEnergyMwh * 10000) / 10000 : 0,
+      totalTargetEnergyMwh > 0 ? Math.round(Math.abs(totalEnergyForPenalty) / totalTargetEnergyMwh * 10000) / 10000 : 0,
       Math.round(totalSpotRevenue * 100) / 100,
       Math.round(deviationPenalty * 100) / 100,
       Math.round(totalRevenue * 100) / 100,
@@ -1146,6 +1194,429 @@ function getResourceRevenueAllocations(resourceId, tradingDayId) {
   return db.prepare(sql).all(resourceId, tradingDayId);
 }
 
+function getCurrentOutputByHour(aggregatorId, tradingDayId, hour) {
+  const rows = db.prepare(`
+    SELECT resource_id, allocated_output_kw
+    FROM (
+      SELECT resource_id, allocated_output_kw, ROW_NUMBER() OVER (
+        PARTITION BY resource_id
+        ORDER BY is_real_time_adjustment DESC, created_at DESC, id DESC
+      ) as rn
+      FROM vpp_output_distributions
+      WHERE aggregator_id = ? AND trading_day_id = ? AND hour = ?
+    )
+    WHERE rn = 1
+  `).all(aggregatorId, tradingDayId, hour);
+
+  const latestByResource = {};
+  for (const row of rows) {
+    latestByResource[row.resource_id] = row.allocated_output_kw;
+  }
+
+  return latestByResource;
+}
+
+function calculateRealTimeAdjustableMargin(aggregatorId, tradingDayId, hour) {
+  const aggregator = getAggregatorById(aggregatorId);
+  if (!aggregator) {
+    throw new Error('聚合商不存在');
+  }
+
+  const resources = listResourcesByAggregator(aggregatorId);
+  const currentOutputs = getCurrentOutputByHour(aggregatorId, tradingDayId, hour);
+
+  let totalIncreaseMarginKw = 0;
+  let totalDecreaseMarginKw = 0;
+  const resourceDetails = [];
+
+  for (const r of resources) {
+    const range = getResourceAdjustableRange(r, tradingDayId, hour);
+    const currentKw = currentOutputs[r.id] != null ? currentOutputs[r.id] : 0;
+
+    const increaseMarginKw = Math.max(0, range.max_kw - currentKw);
+    const decreaseMarginKw = Math.max(0, currentKw - range.min_kw);
+
+    totalIncreaseMarginKw += increaseMarginKw;
+    totalDecreaseMarginKw += decreaseMarginKw;
+
+    resourceDetails.push({
+      resource_id: r.id,
+      resource_code: r.code,
+      resource_name: r.name,
+      type: r.type,
+      ramp_rate_kw_per_min: r.ramp_rate_kw_per_min,
+      current_output_kw: Math.round(currentKw * 10000) / 10000,
+      adjustable_min_kw: range.min_kw,
+      adjustable_max_kw: range.max_kw,
+      increase_margin_kw: Math.round(increaseMarginKw * 10000) / 10000,
+      decrease_margin_kw: Math.round(decreaseMarginKw * 10000) / 10000
+    });
+  }
+
+  return {
+    aggregator_id: aggregatorId,
+    aggregator_code: aggregator.code,
+    aggregator_name: aggregator.name,
+    trading_day_id: tradingDayId,
+    hour: hour,
+    total_increase_margin_mw: Math.round(totalIncreaseMarginKw / 1000 * 10000) / 10000,
+    total_decrease_margin_mw: Math.round(totalDecreaseMarginKw / 1000 * 10000) / 10000,
+    total_increase_margin_kw: Math.round(totalIncreaseMarginKw * 10000) / 10000,
+    total_decrease_margin_kw: Math.round(totalDecreaseMarginKw * 10000) / 10000,
+    resource_count: resources.length,
+    resources: resourceDetails
+  };
+}
+
+function distributeRealTimeAdjustment(
+  aggregatorId,
+  tradingDayId,
+  hour,
+  targetAdjustmentKw,
+  responseTimeSeconds,
+  currentOutputs,
+  marginInfo
+) {
+  const resources = listResourcesByAggregator(aggregatorId);
+  const responseTimeMinutes = responseTimeSeconds / 60;
+
+  const resourceData = [];
+  for (const r of resources) {
+    const marginRes = marginInfo.resources.find(x => x.resource_id === r.id);
+    if (!marginRes) continue;
+
+    const maxRampCapacityKw = r.ramp_rate_kw_per_min * responseTimeMinutes;
+    let maxAdjustmentKw;
+
+    if (targetAdjustmentKw > 0) {
+      maxAdjustmentKw = Math.min(marginRes.increase_margin_kw, maxRampCapacityKw);
+    } else {
+      maxAdjustmentKw = -Math.min(marginRes.decrease_margin_kw, maxRampCapacityKw);
+    }
+
+    resourceData.push({
+      resource: r,
+      current_kw: marginRes.current_output_kw,
+      max_adjustment_kw: maxAdjustmentKw,
+      ramp_capacity_kw: maxRampCapacityKw,
+      margin_kw: targetAdjustmentKw > 0 ? marginRes.increase_margin_kw : marginRes.decrease_margin_kw,
+      adjustment_kw: 0
+    });
+  }
+
+  let remainingAdjustment = targetAdjustmentKw;
+  const totalMaxAdjustment = resourceData.reduce((s, r) => {
+    if (targetAdjustmentKw > 0) {
+      return s + Math.max(0, r.max_adjustment_kw);
+    } else {
+      return s + Math.min(0, r.max_adjustment_kw);
+    }
+  }, 0);
+
+  if (targetAdjustmentKw > 0) {
+    if (totalMaxAdjustment <= 0) {
+      return { actualAdjustmentKw: 0, details: resourceData };
+    }
+
+    for (const rd of resourceData) {
+      if (remainingAdjustment <= 0) break;
+      if (rd.max_adjustment_kw <= 0) continue;
+
+      const proportional = Math.round(
+        remainingAdjustment * rd.max_adjustment_kw / totalMaxAdjustment * 10000
+      ) / 10000;
+      const allocated = Math.min(proportional, rd.max_adjustment_kw, remainingAdjustment);
+
+      rd.adjustment_kw = allocated;
+      remainingAdjustment -= allocated;
+    }
+
+    if (remainingAdjustment > 0.0001) {
+      for (const rd of resourceData) {
+        if (remainingAdjustment <= 0.0001) break;
+        const room = rd.max_adjustment_kw - rd.adjustment_kw;
+        if (room > 0.0001) {
+          const transfer = Math.min(room, remainingAdjustment);
+          rd.adjustment_kw = Math.round((rd.adjustment_kw + transfer) * 10000) / 10000;
+          remainingAdjustment -= transfer;
+        }
+      }
+    }
+  } else {
+    if (totalMaxAdjustment >= 0) {
+      return { actualAdjustmentKw: 0, details: resourceData };
+    }
+
+    for (const rd of resourceData) {
+      if (remainingAdjustment >= 0) break;
+      if (rd.max_adjustment_kw >= 0) continue;
+
+      const proportional = Math.round(
+        remainingAdjustment * rd.max_adjustment_kw / totalMaxAdjustment * 10000
+      ) / 10000;
+      const allocated = Math.max(proportional, rd.max_adjustment_kw, remainingAdjustment);
+
+      rd.adjustment_kw = allocated;
+      remainingAdjustment -= allocated;
+    }
+
+    if (remainingAdjustment < -0.0001) {
+      for (const rd of resourceData) {
+        if (remainingAdjustment >= -0.0001) break;
+        const room = rd.max_adjustment_kw - rd.adjustment_kw;
+        if (room < -0.0001) {
+          const transfer = Math.max(room, remainingAdjustment);
+          rd.adjustment_kw = Math.round((rd.adjustment_kw + transfer) * 10000) / 10000;
+          remainingAdjustment -= transfer;
+        }
+      }
+    }
+  }
+
+  const actualAdjustmentKw = targetAdjustmentKw - remainingAdjustment;
+
+  return {
+    actualAdjustmentKw: Math.round(actualAdjustmentKw * 10000) / 10000,
+    details: resourceData
+  };
+}
+
+function submitRealTimeCommand(aggregatorId, tradingDayId, hour, targetAdjustmentMw, responseTimeSeconds) {
+  const aggregator = getAggregatorById(aggregatorId);
+  if (!aggregator) {
+    throw new Error('聚合商不存在');
+  }
+
+  if (hour == null || hour < 0 || hour > 23) {
+    throw new Error('时段必须在0-23之间');
+  }
+
+  if (targetAdjustmentMw == null) {
+    throw new Error('目标调节量不能为空');
+  }
+
+  if (responseTimeSeconds == null || responseTimeSeconds <= 0) {
+    throw new Error('响应时间必须大于0秒');
+  }
+
+  const targetAdjustmentKw = targetAdjustmentMw * 1000;
+  const marginInfo = calculateRealTimeAdjustableMargin(aggregatorId, tradingDayId, hour);
+  const currentOutputs = getCurrentOutputByHour(aggregatorId, tradingDayId, hour);
+
+  let cappedTargetKw = targetAdjustmentKw;
+  if (targetAdjustmentKw > 0) {
+    cappedTargetKw = Math.min(targetAdjustmentKw, marginInfo.total_increase_margin_kw);
+  } else {
+    cappedTargetKw = Math.max(targetAdjustmentKw, -marginInfo.total_decrease_margin_kw);
+  }
+
+  const distribution = distributeRealTimeAdjustment(
+    aggregatorId,
+    tradingDayId,
+    hour,
+    cappedTargetKw,
+    responseTimeSeconds,
+    currentOutputs,
+    marginInfo
+  );
+
+  const actualResponsiveKw = distribution.actualAdjustmentKw;
+  const actualResponsiveMw = actualResponsiveKw / 1000;
+  const unresponsiveMw = Math.round((targetAdjustmentMw - actualResponsiveMw) * 10000) / 10000;
+  const responseRate = targetAdjustmentMw !== 0
+    ? Math.round(Math.abs(actualResponsiveMw) / Math.abs(targetAdjustmentMw) * 10000) / 10000
+    : 1;
+
+  const tx = db.transaction(() => {
+    const commandId = uuidv4();
+    db.prepare(`
+      INSERT INTO vpp_real_time_commands
+      (id, aggregator_id, trading_day_id, hour, target_adjustment_mw, response_time_seconds,
+       actual_responsive_mw, unresponsive_mw, response_rate, status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      commandId, aggregatorId, tradingDayId, hour,
+      Math.round(targetAdjustmentMw * 10000) / 10000,
+      responseTimeSeconds,
+      Math.round(actualResponsiveMw * 10000) / 10000,
+      Math.abs(unresponsiveMw) > 1e-6 ? Math.round(unresponsiveMw * 10000) / 10000 : 0,
+      responseRate,
+      'processed'
+    );
+
+    for (const rd of distribution.details) {
+      const originalKw = rd.current_kw;
+      const adjustmentKw = Math.round(rd.adjustment_kw * 10000) / 10000;
+      const finalKw = Math.round((originalKw + adjustmentKw) * 10000) / 10000;
+
+      db.prepare(`
+        INSERT INTO vpp_real_time_command_details
+        (id, command_id, resource_id, original_allocated_kw, adjustment_kw,
+         final_allocated_kw, max_ramp_capacity_kw, adjustable_margin_kw)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        uuidv4(), commandId, rd.resource.id,
+        originalKw,
+        adjustmentKw,
+        finalKw,
+        Math.round(rd.ramp_capacity_kw * 10000) / 10000,
+        Math.round(rd.margin_kw * 10000) / 10000
+      );
+
+      if (Math.abs(adjustmentKw) > 1e-6) {
+        db.prepare(`
+          INSERT INTO vpp_output_distributions
+          (id, aggregator_id, trading_day_id, hour, resource_id, real_time_command_id,
+           allocated_output_kw, is_real_time_adjustment)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          uuidv4(), aggregatorId, tradingDayId, hour, rd.resource.id, commandId,
+          finalKw, 1
+        );
+      }
+    }
+
+    return commandId;
+  });
+
+  const commandId = tx();
+
+  return getRealTimeCommandDetail(commandId);
+}
+
+function getRealTimeCommandDetail(commandId) {
+  const command = db.prepare(`
+    SELECT c.*, a.code as aggregator_code, a.name as aggregator_name
+    FROM vpp_real_time_commands c
+    LEFT JOIN vpp_aggregators a ON c.aggregator_id = a.id
+    WHERE c.id = ?
+  `).get(commandId);
+
+  if (!command) return null;
+
+  const details = db.prepare(`
+    SELECT d.*, r.code as resource_code, r.name as resource_name, r.type
+    FROM vpp_real_time_command_details d
+    LEFT JOIN vpp_resources r ON d.resource_id = r.id
+    WHERE d.command_id = ?
+    ORDER BY r.code
+  `).all(commandId);
+
+  return {
+    ...command,
+    details
+  };
+}
+
+function getRealTimeCommands(aggregatorId, tradingDayId) {
+  const aggregator = getAggregatorById(aggregatorId);
+  if (!aggregator) {
+    throw new Error('聚合商不存在');
+  }
+
+  const commands = db.prepare(`
+    SELECT c.*, a.code as aggregator_code, a.name as aggregator_name
+    FROM vpp_real_time_commands c
+    LEFT JOIN vpp_aggregators a ON c.aggregator_id = a.id
+    WHERE c.aggregator_id = ? AND c.trading_day_id = ?
+    ORDER BY c.hour, c.created_at
+  `).all(aggregatorId, tradingDayId);
+
+  return {
+    aggregator_id: aggregatorId,
+    aggregator_code: aggregator.code,
+    aggregator_name: aggregator.name,
+    trading_day_id: tradingDayId,
+    command_count: commands.length,
+    commands
+  };
+}
+
+function getResourceRealTimeHistory(resourceId, tradingDayId) {
+  const resource = getResourceById(resourceId);
+  if (!resource) {
+    throw new Error('资源不存在');
+  }
+
+  const details = db.prepare(`
+    SELECT d.*, c.hour, c.target_adjustment_mw, c.actual_responsive_mw,
+           c.response_time_seconds, c.response_rate, c.created_at as command_time
+    FROM vpp_real_time_command_details d
+    LEFT JOIN vpp_real_time_commands c ON d.command_id = c.id
+    WHERE d.resource_id = ? AND c.trading_day_id = ?
+    ORDER BY c.hour, c.created_at
+  `).all(resourceId, tradingDayId);
+
+  return {
+    resource_id: resourceId,
+    resource_code: resource.code,
+    resource_name: resource.name,
+    trading_day_id: tradingDayId,
+    adjustment_count: details.length,
+    total_adjustment_kw: Math.round(
+      details.reduce((s, d) => s + d.adjustment_kw, 0) * 10000
+    ) / 10000,
+    history: details
+  };
+}
+
+function getCumulativeAdjustment(aggregatorId, tradingDayId, hour) {
+  const aggregator = getAggregatorById(aggregatorId);
+  if (!aggregator) {
+    throw new Error('聚合商不存在');
+  }
+
+  const bid = getVppBid(aggregatorId, tradingDayId, hour);
+  const clearedMw = bid ? bid.cleared_capacity_mw : 0;
+
+  const commands = db.prepare(`
+    SELECT * FROM vpp_real_time_commands
+    WHERE aggregator_id = ? AND trading_day_id = ? AND hour = ?
+    ORDER BY created_at
+  `).all(aggregatorId, tradingDayId, hour);
+
+  const totalRealTimeAdjustmentMw = commands.reduce(
+    (s, c) => s + c.actual_responsive_mw, 0
+  );
+
+  const cumulativeMw = Math.round(
+    (clearedMw + totalRealTimeAdjustmentMw) * 10000
+  ) / 10000;
+
+  const currentOutputs = getCurrentOutputByHour(aggregatorId, tradingDayId, hour);
+  const totalCurrentKw = Object.values(currentOutputs).reduce((s, v) => s + v, 0);
+
+  return {
+    aggregator_id: aggregatorId,
+    aggregator_code: aggregator.code,
+    aggregator_name: aggregator.name,
+    trading_day_id: tradingDayId,
+    hour: hour,
+    day_ahead_cleared_mw: Math.round(clearedMw * 10000) / 10000,
+    total_real_time_adjustment_mw: Math.round(totalRealTimeAdjustmentMw * 10000) / 10000,
+    cumulative_target_mw: cumulativeMw,
+    current_allocated_kw: Math.round(totalCurrentKw * 10000) / 10000,
+    current_allocated_mw: Math.round(totalCurrentKw / 1000 * 10000) / 10000,
+    command_count: commands.length,
+    commands: commands.map(c => ({
+      id: c.id,
+      target_adjustment_mw: c.target_adjustment_mw,
+      actual_responsive_mw: c.actual_responsive_mw,
+      unresponsive_mw: c.unresponsive_mw,
+      response_rate: c.response_rate,
+      created_at: c.created_at
+    }))
+  };
+}
+
+function getHourlyCumulativeAdjustments(aggregatorId, tradingDayId) {
+  const result = [];
+  for (let h = 0; h < 24; h++) {
+    result.push(getCumulativeAdjustment(aggregatorId, tradingDayId, h));
+  }
+  return result;
+}
+
 module.exports = {
   RESOURCE_TYPES,
   RESOURCE_TYPE_LABELS,
@@ -1182,5 +1653,13 @@ module.exports = {
   getVppSettlement,
   getVppSettlementDetail,
   getVppRevenueAllocations,
-  getResourceRevenueAllocations
+  getResourceRevenueAllocations,
+  getCurrentOutputByHour,
+  calculateRealTimeAdjustableMargin,
+  submitRealTimeCommand,
+  getRealTimeCommandDetail,
+  getRealTimeCommands,
+  getResourceRealTimeHistory,
+  getCumulativeAdjustment,
+  getHourlyCumulativeAdjustments
 };
