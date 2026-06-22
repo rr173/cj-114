@@ -896,6 +896,92 @@ function initDatabase() {
       created_at TEXT DEFAULT (datetime('now')),
       FOREIGN KEY (participant_id) REFERENCES market_participants(id)
     );
+
+    CREATE TABLE IF NOT EXISTS grid_buses (
+      id TEXT PRIMARY KEY,
+      code TEXT UNIQUE NOT NULL,
+      name TEXT NOT NULL,
+      zone_id TEXT,
+      bus_type TEXT NOT NULL CHECK(bus_type IN ('generator', 'load', 'tie')),
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (zone_id) REFERENCES price_zones(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS grid_lines (
+      id TEXT PRIMARY KEY,
+      code TEXT UNIQUE NOT NULL,
+      from_bus_id TEXT NOT NULL,
+      to_bus_id TEXT NOT NULL,
+      reactance REAL NOT NULL,
+      thermal_limit REAL NOT NULL,
+      status TEXT NOT NULL DEFAULT 'in_service' CHECK(status IN ('in_service', 'out_of_service')),
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (from_bus_id) REFERENCES grid_buses(id),
+      FOREIGN KEY (to_bus_id) REFERENCES grid_buses(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS grid_bus_participants (
+      id TEXT PRIMARY KEY,
+      bus_id TEXT NOT NULL,
+      participant_id TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (bus_id) REFERENCES grid_buses(id) ON DELETE CASCADE,
+      FOREIGN KEY (participant_id) REFERENCES market_participants(id) ON DELETE CASCADE,
+      UNIQUE(bus_id, participant_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS grid_security_alerts (
+      id TEXT PRIMARY KEY,
+      trading_day_id TEXT NOT NULL,
+      trade_date TEXT NOT NULL,
+      hour INTEGER NOT NULL CHECK(hour BETWEEN 0 AND 23),
+      security_level TEXT NOT NULL CHECK(security_level IN ('safe', 'warning', 'critical')),
+      alert_details TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (trading_day_id) REFERENCES trading_days(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS grid_security_violations (
+      id TEXT PRIMARY KEY,
+      alert_id TEXT NOT NULL,
+      line_id TEXT NOT NULL,
+      line_code TEXT NOT NULL,
+      actual_flow REAL NOT NULL,
+      thermal_limit REAL NOT NULL,
+      violation_ratio REAL NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (alert_id) REFERENCES grid_security_alerts(id) ON DELETE CASCADE,
+      FOREIGN KEY (line_id) REFERENCES grid_lines(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS grid_redispatch_suggestions (
+      id TEXT PRIMARY KEY,
+      alert_id TEXT NOT NULL,
+      trading_day_id TEXT NOT NULL,
+      hour INTEGER NOT NULL CHECK(hour BETWEEN 0 AND 23),
+      original_state TEXT NOT NULL,
+      adjusted_state TEXT NOT NULL,
+      adjustments TEXT NOT NULL,
+      expected_relief TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (alert_id) REFERENCES grid_security_alerts(id) ON DELETE CASCADE,
+      FOREIGN KEY (trading_day_id) REFERENCES trading_days(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS grid_nminus1_results (
+      id TEXT PRIMARY KEY,
+      trading_day_id TEXT NOT NULL,
+      trade_date TEXT NOT NULL,
+      hour INTEGER NOT NULL CHECK(hour BETWEEN 0 AND 23),
+      outage_line_id TEXT NOT NULL,
+      outage_line_code TEXT NOT NULL,
+      is_critical INTEGER NOT NULL DEFAULT 0,
+      system_islanded INTEGER NOT NULL DEFAULT 0,
+      violation_details TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (trading_day_id) REFERENCES trading_days(id),
+      FOREIGN KEY (outage_line_id) REFERENCES grid_lines(id)
+    );
   `);
 }
 

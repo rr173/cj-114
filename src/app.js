@@ -17,6 +17,7 @@ const settlementDisputesRouter = require('./routes/settlementDisputes');
 const ftrRouter = require('./routes/ftr');
 const creditRouter = require('./routes/creditRoutes');
 const monthlyReportRouter = require('./routes/monthlyReportRoutes');
+const gridRouter = require('./routes/grid');
 
 const app = express();
 
@@ -39,6 +40,7 @@ app.use('/api/settlement-disputes', settlementDisputesRouter);
 app.use('/api/ftr', ftrRouter);
 app.use('/api/credit', creditRouter);
 app.use('/api/monthly-reports', monthlyReportRouter);
+app.use('/api/grid', gridRouter);
 
 app.get('/api/health', (req, res) => {
   res.json({
