@@ -422,7 +422,7 @@ function calculateBusInjections(busParticipantMap, participantOutputs) {
   return injections;
 }
 
-function calculatePowerFlow(injectionData) {
+function calculatePowerFlow(injectionData, allowImbalance = false) {
   const buses = listBuses();
   const lines = listLines();
   
@@ -448,8 +448,11 @@ function calculatePowerFlow(injectionData) {
   const P = buses.map(bus => injections[bus.id] || 0);
   
   const totalInjection = P.reduce((s, v) => s + v, 0);
-  if (Math.abs(totalInjection) > 1e-6) {
+  if (!allowImbalance && Math.abs(totalInjection) > 1e-6) {
     throw new Error(`节点注入功率不平衡，总和为 ${totalInjection.toFixed(4)} MW，必须为0`);
+  }
+  if (allowImbalance && Math.abs(totalInjection) > 1e-6) {
+    P[0] -= totalInjection;
   }
   
   const slackBusIdx = 0;
@@ -695,7 +698,95 @@ function getAlertDetails(alertId) {
   };
 }
 
+function computeGSDF(buses, lines, busIndex, lineList) {
+  const n = buses.length;
+  const slackIdx = 0;
+  
+  const B = Array(n).fill(0).map(() => Array(n).fill(0));
+  for (const line of lines) {
+    if (line.status !== 'in_service') continue;
+    const i = busIndex[line.from_bus_id];
+    const j = busIndex[line.to_bus_id];
+    if (i === undefined || j === undefined) continue;
+    const b = 1 / line.reactance;
+    B[i][i] += b;
+    B[j][j] += b;
+    B[i][j] -= b;
+    B[j][i] -= b;
+  }
+  
+  const reducedN = n - 1;
+  const BRed = [];
+  const idxMap = [];
+  for (let i = 0; i < n; i++) {
+    if (i === slackIdx) continue;
+    idxMap.push(i);
+    const row = [];
+    for (let j = 0; j < n; j++) {
+      if (j === slackIdx) continue;
+      row.push(B[i][j]);
+    }
+    BRed.push(row);
+  }
+  
+  const solveTheta = (busKIdx) => {
+    if (busKIdx === slackIdx) {
+      const rhs = Array(reducedN).fill(-1);
+      return gaussianElimination(BRed.map(r => r.slice()), rhs);
+    } else {
+      const kRed = idxMap.indexOf(busKIdx);
+      if (kRed < 0) return null;
+      const rhs = Array(reducedN).fill(0);
+      rhs[kRed] = 1;
+      return gaussianElimination(BRed.map(r => r.slice()), rhs);
+    }
+  };
+  
+  const gsdf = {};
+  
+  for (let lineIdx = 0; lineIdx < lineList.length; lineIdx++) {
+    const line = lineList[lineIdx];
+    if (line.status !== 'in_service') continue;
+    const fromI = busIndex[line.from_bus_id];
+    const toI = busIndex[line.to_bus_id];
+    if (fromI === undefined || toI === undefined) continue;
+    const b_l = 1 / line.reactance;
+    
+    for (let busK = 0; busK < n; busK++) {
+      const thetaRed = solveTheta(busK);
+      if (!thetaRed) continue;
+      
+      let thetaFrom = 0;
+      let thetaTo = 0;
+      if (fromI !== slackIdx) {
+        thetaFrom = thetaRed[idxMap.indexOf(fromI)];
+      }
+      if (toI !== slackIdx) {
+        thetaTo = thetaRed[idxMap.indexOf(toI)];
+      }
+      
+      const sensitivity = b_l * (thetaFrom - thetaTo);
+      if (!gsdf[line.id]) gsdf[line.id] = {};
+      gsdf[line.id][buses[busK].id] = sensitivity;
+    }
+  }
+  
+  return gsdf;
+}
+
+function computeViolationSeverity(violations) {
+  let severity = 0;
+  for (const v of violations) {
+    const loading = v.loading_percent !== undefined ? v.loading_percent : (Math.abs(v.actual_flow_mw || v.flow_mw || 0) / (v.thermal_limit_mw || v.thermal_limit || 1) * 100);
+    severity += Math.max(0, loading - 100);
+  }
+  return severity;
+}
+
 function generateRedispatchSuggestion(alertId) {
+  const STEP_MW = 10;
+  const MAX_ITERATIONS = 30;
+  
   const alert = getAlertDetails(alertId);
   if (!alert) throw new Error('安全校核告警不存在');
   if (alert.violations.length === 0) {
@@ -707,10 +798,10 @@ function generateRedispatchSuggestion(alertId) {
   const td = getTradingDayById(tradingDayId);
   
   const buses = listBuses();
-  const busZoneMap = {};
-  for (const bus of buses) {
-    busZoneMap[bus.id] = bus.zone_id;
-  }
+  const busIndex = {};
+  buses.forEach((bus, i) => { busIndex[bus.id] = i; });
+  
+  const lines = listLines();
   
   const busParticipantMap = {};
   for (const bus of buses) {
@@ -726,16 +817,16 @@ function generateRedispatchSuggestion(alertId) {
     }
   }
   
+  const allParticipants = listParticipants('generator');
+  const participantMap = {};
+  for (const p of allParticipants) participantMap[p.id] = p;
+  
   const clearingRows = db.prepare(`
-    SELECT ca.participant_id, ca.final_dispatch, mp.type, mp.code, mp.name,
-           gb.price as bid_price
+    SELECT ca.participant_id, ca.final_dispatch, mp.type, mp.code, mp.name
     FROM clearing_allocations ca
     JOIN clearing_results cr ON ca.clearing_result_id = cr.id
     JOIN market_participants mp ON ca.participant_id = mp.id
-    LEFT JOIN generator_bids gb ON gb.participant_id = ca.participant_id 
-      AND gb.trading_day_id = cr.trading_day_id AND gb.hour = cr.hour
     WHERE cr.trading_day_id = ? AND cr.hour = ? AND mp.type = 'generator'
-    ORDER BY gb.price ASC
   `).all(tradingDayId, hour);
   
   const generatorBids = db.prepare(`
@@ -769,151 +860,287 @@ function generateRedispatchSuggestion(alertId) {
     currentOutput[row.participant_id] = row.final_dispatch;
   }
   
-  const violatedLines = alert.violations;
-  const lineInfo = listLines();
-  const lineMap = {};
-  for (const l of lineInfo) lineMap[l.id] = l;
-  
-  const senderZoneSet = new Set();
-  const receiverZoneSet = new Set();
-  
-  for (const v of violatedLines) {
-    const line = lineMap[v.line_id];
-    if (!line) continue;
-    const flowDir = v.actual_flow_mw > 0 ? 'forward' : 'reverse';
-    let senderBusId, receiverBusId;
-    if (flowDir === 'forward') {
-      senderBusId = line.from_bus_id;
-      receiverBusId = line.to_bus_id;
-    } else {
-      senderBusId = line.to_bus_id;
-      receiverBusId = line.from_bus_id;
-    }
-    const senderZone = busZoneMap[senderBusId];
-    const receiverZone = busZoneMap[receiverBusId];
-    if (senderZone) senderZoneSet.add(senderZone);
-    if (receiverZone) receiverZoneSet.add(receiverZone);
+  const consumerRows = db.prepare(`
+    SELECT ca.participant_id, ca.final_dispatch
+    FROM clearing_allocations ca
+    JOIN clearing_results cr ON ca.clearing_result_id = cr.id
+    JOIN market_participants mp ON ca.participant_id = mp.id
+    WHERE cr.trading_day_id = ? AND cr.hour = ? AND mp.type = 'consumer'
+  `).all(tradingDayId, hour);
+  const consumerInjections = {};
+  for (const row of consumerRows) {
+    consumerInjections[row.participant_id] = -row.final_dispatch;
   }
   
-  const adjustments = [];
-  const adjustedOutput = { ...currentOutput };
-  const STEP_MW = 10;
-  const MAX_ITERATIONS = 50;
+  const violatedLines = alert.violations;
+  const violatedLineIds = new Set(violatedLines.map(v => v.line_id));
   
-  const checkViolation = () => {
-    const injections = {};
-    for (const [pid, out] of Object.entries(adjustedOutput)) {
-      injections[pid] = out;
-    }
-    const consumerRows = db.prepare(`
-      SELECT ca.participant_id, ca.final_dispatch
-      FROM clearing_allocations ca
-      JOIN clearing_results cr ON ca.clearing_result_id = cr.id
-      JOIN market_participants mp ON ca.participant_id = mp.id
-      WHERE cr.trading_day_id = ? AND cr.hour = ? AND mp.type = 'consumer'
-    `).all(tradingDayId, hour);
-    for (const row of consumerRows) {
-      injections[row.participant_id] = -row.final_dispatch;
+  const activeLines = lines.filter(l => l.status === 'in_service');
+  const gsdf = computeGSDF(buses, lines, busIndex, activeLines);
+  
+  const genSensitivity = {};
+  for (const pid of Object.keys(currentOutput)) {
+    const participant = participantMap[pid];
+    if (!participant) continue;
+    const busIds = participantBusMap[pid] || [];
+    if (busIds.length === 0) continue;
+    
+    let totalScoreDown = 0;
+    let totalScoreUp = 0;
+    
+    for (const busId of busIds) {
+      for (const v of violatedLines) {
+        const sens = gsdf[v.line_id]?.[busId];
+        if (sens === undefined) continue;
+        const overloadMW = Math.abs(v.actual_flow_mw) - v.thermal_limit_mw;
+        if (overloadMW <= 0) continue;
+        
+        const line = lines.find(l => l.id === v.line_id);
+        if (!line) continue;
+        const flowDir = v.actual_flow_mw > 0 ? 1 : -1;
+        
+        const reliefDown = sens * flowDir * STEP_MW;
+        if (reliefDown > 0) totalScoreDown += reliefDown / Math.max(1, overloadMW);
+        
+        const reliefUp = -sens * flowDir * STEP_MW;
+        if (reliefUp > 0) totalScoreUp += reliefUp / Math.max(1, overloadMW);
+      }
     }
     
+    genSensitivity[pid] = {
+      participant_id: pid,
+      code: participant.code,
+      name: participant.name,
+      bid_price: genBidPrice[pid] || 9999,
+      current_output: currentOutput[pid],
+      installed_capacity: participant.installed_capacity || genMaxOutput[pid] || 0,
+      can_decrease: currentOutput[pid] >= STEP_MW,
+      can_increase: (participant.installed_capacity || genMaxOutput[pid] || 0) - currentOutput[pid] >= STEP_MW,
+      score_down: totalScoreDown,
+      score_up: totalScoreUp
+    };
+  }
+  
+  const buildInjections = (outputs) => {
+    const inj = {};
+    for (const [pid, out] of Object.entries(outputs)) inj[pid] = out;
+    Object.assign(inj, consumerInjections);
+    return inj;
+  };
+  
+  const checkViolation = (outputs) => {
     try {
-      const result = calculatePowerFlow(injections);
+      const result = calculatePowerFlow(buildInjections(outputs), true);
       return result.line_flows.filter(l => l.is_violated);
     } catch (e) {
-      return violatedLines;
+      return violatedLines.map(v => ({
+        line_id: v.line_id,
+        line_code: v.line_code,
+        flow_mw: v.actual_flow_mw,
+        thermal_limit: v.thermal_limit_mw,
+        loading_percent: v.violation_percent,
+        is_violated: true
+      }));
     }
   };
   
-  let remainingViolations = checkViolation();
-  let iteration = 0;
+  const ADJUSTED_SET = new Set();
   
-  while (remainingViolations.length > 0 && iteration < MAX_ITERATIONS) {
+  const adjustments = [];
+  const adjustedOutput = { ...currentOutput };
+  let remainingViolations = checkViolation(adjustedOutput);
+  let currentSeverity = computeViolationSeverity(remainingViolations);
+  let iteration = 0;
+  let noImprovementCount = 0;
+  
+  while (remainingViolations.length > 0 && iteration < MAX_ITERATIONS && noImprovementCount < 3) {
     iteration++;
     
-    const senderGens = [];
-    const receiverGens = [];
+    const downCandidates = [];
+    const upCandidates = [];
+    for (const pid of Object.keys(genSensitivity)) {
+      const s = genSensitivity[pid];
+      const output = adjustedOutput[pid];
+      const canDown = output >= STEP_MW;
+      const canUp = (s.installed_capacity - output) >= STEP_MW;
+      
+      if (canDown && s.score_down > 0.001) {
+        downCandidates.push({
+          pid,
+          score: s.score_down - s.bid_price * 0.0001,
+          sensitivity: s
+        });
+      }
+      if (canUp && s.score_up > 0.001) {
+        upCandidates.push({
+          pid,
+          score: s.score_up + (9999 - s.bid_price) * 0.0001,
+          sensitivity: s
+        });
+      }
+    }
     
-    for (const pid of Object.keys(adjustedOutput)) {
-      const busIds = participantBusMap[pid] || [];
-      for (const busId of busIds) {
-        const zoneId = busZoneMap[busId];
-        const participant = getParticipantById(pid);
-        if (!participant || participant.type !== 'generator') continue;
+    downCandidates.sort((a, b) => b.score - a.score);
+    upCandidates.sort((a, b) => b.score - a.score);
+    
+    let bestPair = null;
+    let bestSeverity = currentSeverity;
+    
+    const topDowns = downCandidates.slice(0, 6);
+    const topUps = upCandidates.slice(0, 6);
+    
+    for (let i = 0; i < topDowns.length; i++) {
+      for (let j = 0; j < topUps.length; j++) {
+        const dc = topDowns[i];
+        const uc = topUps[j];
+        if (dc.pid === uc.pid) continue;
+        if (ADJUSTED_SET.has(dc.pid + '_decrease_' + uc.pid + '_increase') && iteration > 5) continue;
         
-        if (senderZoneSet.has(zoneId)) {
-          senderGens.push({
-            participant_id: pid,
-            code: participant.code,
-            name: participant.name,
-            current_output: adjustedOutput[pid],
-            bid_price: genBidPrice[pid] || 9999,
-            zone_id: zoneId
-          });
-        }
-        if (receiverZoneSet.has(zoneId)) {
-          receiverGens.push({
-            participant_id: pid,
-            code: participant.code,
-            name: participant.name,
-            current_output: adjustedOutput[pid],
-            installed_capacity: participant.installed_capacity || genMaxOutput[pid] || 0,
-            bid_price: genBidPrice[pid] || 9999,
-            zone_id: zoneId
-          });
+        const trialOutput = { ...adjustedOutput };
+        trialOutput[dc.pid] -= STEP_MW;
+        trialOutput[uc.pid] += STEP_MW;
+        
+        const trialViolations = checkViolation(trialOutput);
+        const trialSeverity = computeViolationSeverity(trialViolations);
+        
+        if (trialSeverity < bestSeverity - 0.001) {
+          bestSeverity = trialSeverity;
+          bestPair = {
+            down: dc,
+            up: uc,
+            trial_output: trialOutput,
+            trial_violations: trialViolations,
+            trial_severity: trialSeverity
+          };
         }
       }
     }
     
-    senderGens.sort((a, b) => b.bid_price - a.bid_price);
-    receiverGens.sort((a, b) => a.bid_price - b.bid_price);
+    for (const dc of topDowns.slice(0, 3)) {
+      if (ADJUSTED_SET.has(dc.pid + '_decrease_only') && iteration > 5) continue;
+      const trialOutput = { ...adjustedOutput };
+      trialOutput[dc.pid] -= STEP_MW;
+      const trialViolations = checkViolation(trialOutput);
+      const trialSeverity = computeViolationSeverity(trialViolations);
+      if (trialSeverity < bestSeverity - 0.001) {
+        bestSeverity = trialSeverity;
+        bestPair = {
+          down: dc,
+          up: null,
+          trial_output: trialOutput,
+          trial_violations: trialViolations,
+          trial_severity: trialSeverity
+        };
+      }
+    }
+    for (const uc of topUps.slice(0, 3)) {
+      if (ADJUSTED_SET.has(uc.pid + '_increase_only') && iteration > 5) continue;
+      const trialOutput = { ...adjustedOutput };
+      trialOutput[uc.pid] += STEP_MW;
+      const trialViolations = checkViolation(trialOutput);
+      const trialSeverity = computeViolationSeverity(trialViolations);
+      if (trialSeverity < bestSeverity - 0.001) {
+        bestSeverity = trialSeverity;
+        bestPair = {
+          down: null,
+          up: uc,
+          trial_output: trialOutput,
+          trial_violations: trialViolations,
+          trial_severity: trialSeverity
+        };
+      }
+    }
     
-    const adjustableSender = senderGens.find(g => g.current_output >= STEP_MW);
-    const adjustableReceiver = receiverGens.find(g => 
-      (g.installed_capacity - g.current_output) >= STEP_MW
-    );
-    
-    if (!adjustableSender && !adjustableReceiver) {
+    if (!bestPair) {
+      noImprovementCount++;
       break;
     }
     
-    if (adjustableSender) {
-      adjustedOutput[adjustableSender.participant_id] -= STEP_MW;
+    if (bestPair.down) {
+      const pid = bestPair.down.pid;
+      const s = bestPair.down.sensitivity;
+      const oldOutput = adjustedOutput[pid];
+      adjustedOutput[pid] -= STEP_MW;
       adjustments.push({
-        participant_id: adjustableSender.participant_id,
-        code: adjustableSender.code,
-        name: adjustableSender.name,
-        action: 'decrease',
-        amount_mw: STEP_MW,
-        bid_price: adjustableSender.bid_price,
-        from_output: adjustableSender.current_output,
-        to_output: adjustableSender.current_output - STEP_MW
+        participant_id: pid, code: s.code, name: s.name,
+        action: 'decrease', amount_mw: STEP_MW, bid_price: s.bid_price,
+        from_output: oldOutput, to_output: oldOutput - STEP_MW,
+        relief_score: s.score_down
       });
+      if (bestPair.up) {
+        ADJUSTED_SET.add(pid + '_decrease_' + bestPair.up.pid + '_increase');
+      } else {
+        ADJUSTED_SET.add(pid + '_decrease_only');
+      }
     }
     
-    if (adjustableReceiver) {
-      adjustedOutput[adjustableReceiver.participant_id] += STEP_MW;
+    if (bestPair.up) {
+      const pid = bestPair.up.pid;
+      const s = bestPair.up.sensitivity;
+      const oldOutput = adjustedOutput[pid];
+      adjustedOutput[pid] += STEP_MW;
       adjustments.push({
-        participant_id: adjustableReceiver.participant_id,
-        code: adjustableReceiver.code,
-        name: adjustableReceiver.name,
-        action: 'increase',
-        amount_mw: STEP_MW,
-        bid_price: adjustableReceiver.bid_price,
-        from_output: adjustableReceiver.current_output,
-        to_output: adjustableReceiver.current_output + STEP_MW
+        participant_id: pid, code: s.code, name: s.name,
+        action: 'increase', amount_mw: STEP_MW, bid_price: s.bid_price,
+        from_output: oldOutput, to_output: oldOutput + STEP_MW,
+        relief_score: s.score_up
       });
+      if (!bestPair.down) {
+        ADJUSTED_SET.add(pid + '_increase_only');
+      }
     }
     
-    if (!adjustableSender || !adjustableReceiver) {
-      break;
+    remainingViolations = bestPair.trial_violations;
+    const newSeverity = computeViolationSeverity(remainingViolations);
+    if (newSeverity >= currentSeverity - 0.001) {
+      noImprovementCount++;
+    } else {
+      noImprovementCount = 0;
     }
-    
-    remainingViolations = checkViolation();
+    currentSeverity = newSeverity;
   }
   
-  const finalViolations = checkViolation();
+  const finalViolations = checkViolation(adjustedOutput);
   const originalViolationCount = violatedLines.length;
   const finalViolationCount = finalViolations.length;
+  
+  const mergedAdjustments = [];
+  const adjMap = {};
+  for (const adj of adjustments) {
+    const key = adj.participant_id;
+    if (!adjMap[key]) {
+      adjMap[key] = {
+        participant_id: adj.participant_id,
+        code: adj.code,
+        name: adj.name,
+        total_decrease: 0,
+        total_increase: 0,
+        bid_price: adj.bid_price,
+        from_output: adj.from_output,
+        to_output: adj.to_output
+      };
+    }
+    if (adj.action === 'decrease') {
+      adjMap[key].total_decrease += adj.amount_mw;
+    } else {
+      adjMap[key].total_increase += adj.amount_mw;
+    }
+    adjMap[key].to_output = adj.to_output;
+  }
+  for (const [pid, info] of Object.entries(adjMap)) {
+    const net = info.total_increase - info.total_decrease;
+    if (Math.abs(net) < 0.5) continue;
+    mergedAdjustments.push({
+      participant_id: pid,
+      code: info.code,
+      name: info.name,
+      action: net > 0 ? 'increase' : 'decrease',
+      amount_mw: Math.abs(net),
+      bid_price: info.bid_price,
+      from_output: info.from_output,
+      to_output: info.to_output
+    });
+  }
   
   const suggestionId = uuidv4();
   db.prepare(`
@@ -924,11 +1151,16 @@ function generateRedispatchSuggestion(alertId) {
     suggestionId, alertId, tradingDayId, hour,
     JSON.stringify(currentOutput),
     JSON.stringify(adjustedOutput),
-    JSON.stringify(adjustments),
+    JSON.stringify(mergedAdjustments),
     JSON.stringify({
       original_violation_count: originalViolationCount,
       final_violation_count: finalViolationCount,
       relieved_count: originalViolationCount - finalViolationCount,
+      original_severity: computeViolationSeverity(violatedLines.map(v => ({
+        loading_percent: v.violation_percent
+      }))),
+      final_severity: computeViolationSeverity(finalViolations),
+      iterations: iteration,
       remaining_violations: finalViolations.map(v => ({
         line_id: v.line_id,
         line_code: v.line_code,
@@ -945,7 +1177,8 @@ function generateRedispatchSuggestion(alertId) {
     trading_day_id: tradingDayId,
     trade_date: td.trade_date,
     hour,
-    adjustments: adjustments,
+    iterations: iteration,
+    adjustments: mergedAdjustments,
     original_violations: violatedLines.map(v => ({
       line_code: v.line_code,
       actual_flow_mw: v.actual_flow_mw,
@@ -956,6 +1189,10 @@ function generateRedispatchSuggestion(alertId) {
       original_violation_count: originalViolationCount,
       final_violation_count: finalViolationCount,
       relieved_count: originalViolationCount - finalViolationCount,
+      original_severity: computeViolationSeverity(violatedLines.map(v => ({
+        loading_percent: v.violation_percent
+      }))),
+      final_severity: computeViolationSeverity(finalViolations),
       remaining_violations: finalViolations.map(v => ({
         line_code: v.line_code,
         flow_mw: v.flow_mw,
