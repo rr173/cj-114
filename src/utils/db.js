@@ -1072,9 +1072,12 @@ function initDatabase() {
       hour INTEGER NOT NULL CHECK(hour BETWEEN 0 AND 23),
       allocated_output_kw REAL NOT NULL,
       actual_output_kw REAL NOT NULL,
+      raw_actual_output_kw REAL,
       deviation_kw REAL NOT NULL,
       deviation_rate REAL NOT NULL,
       is_compliant INTEGER NOT NULL DEFAULT 1,
+      redistributed_amount_kw REAL DEFAULT 0,
+      redistributed_to_deficit_kw REAL DEFAULT 0,
       created_at TEXT DEFAULT (datetime('now')),
       FOREIGN KEY (resource_id) REFERENCES vpp_resources(id),
       FOREIGN KEY (trading_day_id) REFERENCES trading_days(id),
@@ -1141,6 +1144,9 @@ try { db.exec(`ALTER TABLE settlement_details ADD COLUMN exempt_amount REAL DEFA
 try { db.exec(`ALTER TABLE clearing_results ADD COLUMN clearing_type TEXT DEFAULT 'unified' CHECK(clearing_type IN ('unified', 'zoned'))`); } catch (e) {}
 try { db.exec(`ALTER TABLE market_participants ADD COLUMN energy_type TEXT`); } catch (e) {}
 try { db.exec(`ALTER TABLE credit_scores ADD COLUMN manually_adjusted INTEGER NOT NULL DEFAULT 0`); } catch (e) {}
+try { db.exec(`ALTER TABLE vpp_performance_records ADD COLUMN raw_actual_output_kw REAL`); } catch (e) {}
+try { db.exec(`ALTER TABLE vpp_performance_records ADD COLUMN redistributed_amount_kw REAL DEFAULT 0`); } catch (e) {}
+try { db.exec(`ALTER TABLE vpp_performance_records ADD COLUMN redistributed_to_deficit_kw REAL DEFAULT 0`); } catch (e) {}
 
 try {
   const initCreditData = db.transaction(() => {

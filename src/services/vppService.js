@@ -625,6 +625,10 @@ function getActualOutputsByAggregator(aggregatorId, tradingDayId) {
   };
 }
 
+function transferableAmount(raw, adjusted) {
+  return Math.max(0, adjusted - raw);
+}
+
 function evaluatePerformanceAndRedistribute(aggregatorId, tradingDayId) {
   const aggregator = getAggregatorById(aggregatorId);
   if (!aggregator) {
@@ -635,46 +639,168 @@ function evaluatePerformanceAndRedistribute(aggregatorId, tradingDayId) {
   const results = [];
   const month = new Date().toISOString().slice(0, 7);
 
+  const hourlyAllocations = {};
+  const hourlyActuals = {};
+  const distributionsMap = {};
+  const actualsMap = {};
+
+  for (const resource of resources) {
+    const distributions = getResourceOutputDistribution(resource.id, tradingDayId);
+    const actuals = getActualOutputsByResource(resource.id, tradingDayId);
+    distributionsMap[resource.id] = distributions;
+    actualsMap[resource.id] = {};
+    for (const a of actuals) actualsMap[resource.id][a.hour] = a.actual_output_kw;
+
+    for (const d of distributions) {
+      if (!hourlyAllocations[d.hour]) hourlyAllocations[d.hour] = {};
+      if (!hourlyActuals[d.hour]) hourlyActuals[d.hour] = {};
+      hourlyAllocations[d.hour][resource.id] = d.allocated_output_kw;
+      hourlyActuals[d.hour][resource.id] = actualsMap[resource.id][d.hour] != null ? actualsMap[resource.id][d.hour] : 0;
+    }
+  }
+
+  const hours = Object.keys(hourlyAllocations).map(h => parseInt(h)).sort((a, b) => a - b);
+  const adjustedResults = {};
+
+  for (const hour of hours) {
+    const allocs = hourlyAllocations[hour];
+    const actuals = hourlyActuals[hour];
+    const resourceIds = Object.keys(allocs);
+
+    let totalAlloc = 0;
+    let totalActual = 0;
+    for (const rid of resourceIds) {
+      totalAlloc += allocs[rid];
+      totalActual += actuals[rid];
+    }
+
+    const overallDeviation = totalActual - totalAlloc;
+    const overallDeviationRate = totalAlloc > 0 ? Math.abs(overallDeviation) / totalAlloc : 0;
+    const hourOverallCompliant = overallDeviationRate <= (1 - COMPLIANCE_THRESHOLD);
+
+    if (hourOverallCompliant) {
+      let deficit = 0;
+      let surplus = 0;
+      for (const rid of resourceIds) {
+        const dev = actuals[rid] - allocs[rid];
+        if (dev < 0) deficit += Math.abs(dev);
+        if (dev > 0) surplus += dev;
+      }
+
+      const transfersMap = {};
+      for (const rid of resourceIds) transfersMap[rid] = 0;
+
+      for (const rid of resourceIds) {
+        const rawDev = actuals[rid] - allocs[rid];
+        if (rawDev < 0 && surplus > 0) {
+          const needed = Math.abs(rawDev);
+          const transferable = Math.min(needed, surplus);
+          transfersMap[rid] += transferable;
+          surplus -= transferable;
+        }
+      }
+
+      let remainingTransfers = 0;
+      for (const rid of resourceIds) remainingTransfers += transfersMap[rid];
+      let remainingSurplusCapacity = 0;
+      for (const rid of resourceIds) {
+        const rawDev = actuals[rid] - allocs[rid];
+        if (rawDev > 0) remainingSurplusCapacity += rawDev;
+      }
+
+      for (const rid of resourceIds) {
+        const rawDev = actuals[rid] - allocs[rid];
+        let adjustedActual = actuals[rid];
+        let redistributedReceived = transfersMap[rid] || 0;
+        let redistributedGiven = 0;
+
+        if (rawDev > 0 && remainingTransfers > 0 && remainingSurplusCapacity > 0) {
+          const takeAway = Math.min(rawDev, remainingTransfers * rawDev / remainingSurplusCapacity);
+          adjustedActual -= takeAway;
+          redistributedGiven = takeAway;
+          remainingTransfers -= takeAway;
+        }
+
+        adjustedActual += redistributedReceived;
+
+        const adjustedDev = adjustedActual - allocs[rid];
+        const adjustedDevRate = allocs[rid] > 0
+          ? Math.abs(adjustedDev) / allocs[rid]
+          : (Math.abs(adjustedActual) > 1e-6 ? 1 : 0);
+        const isCompliant = adjustedDevRate <= (1 - COMPLIANCE_THRESHOLD) ? 1 : 0;
+
+        if (!adjustedResults[rid]) adjustedResults[rid] = {};
+        adjustedResults[rid][hour] = {
+          raw_actual: actuals[rid],
+          adjusted_actual: adjustedActual,
+          allocated: allocs[rid],
+          raw_deviation: rawDev,
+          adjusted_deviation: adjustedDev,
+          adjusted_deviation_rate: adjustedDevRate,
+          is_compliant: isCompliant,
+          redistributed_from_surplus: redistributedReceived,
+          redistributed_to_deficit: redistributedGiven
+        };
+      }
+    } else {
+      for (const rid of resourceIds) {
+        const rawDev = actuals[rid] - allocs[rid];
+        const rawDevRate = allocs[rid] > 0
+          ? Math.abs(rawDev) / allocs[rid]
+          : (Math.abs(actuals[rid]) > 1e-6 ? 1 : 0);
+        const isCompliant = rawDevRate <= (1 - COMPLIANCE_THRESHOLD) ? 1 : 0;
+
+        if (!adjustedResults[rid]) adjustedResults[rid] = {};
+        adjustedResults[rid][hour] = {
+          raw_actual: actuals[rid],
+          adjusted_actual: actuals[rid],
+          allocated: allocs[rid],
+          raw_deviation: rawDev,
+          adjusted_deviation: rawDev,
+          adjusted_deviation_rate: rawDevRate,
+          is_compliant: isCompliant,
+          redistributed_from_surplus: 0,
+          redistributed_to_deficit: 0
+        };
+      }
+    }
+  }
+
   const tx = db.transaction(() => {
     for (const resource of resources) {
-      const distributions = getResourceOutputDistribution(resource.id, tradingDayId);
-      const actuals = getActualOutputsByResource(resource.id, tradingDayId);
-      const actualMap = {};
-      for (const a of actuals) actualMap[a.hour] = a.actual_output_kw;
-
-      let totalAlloc = 0;
-      let totalActual = 0;
+      const distributions = distributionsMap[resource.id] || [];
+      const totalPeriods = distributions.length;
       let compliantPeriods = 0;
-      let totalPeriods = 0;
 
       for (const d of distributions) {
-        const actual = actualMap[d.hour] != null ? actualMap[d.hour] : 0;
-        const deviation = actual - d.allocated_output_kw;
-        const deviationRate = d.allocated_output_kw > 0
-          ? Math.abs(deviation) / d.allocated_output_kw
-          : (Math.abs(actual) > 1e-6 ? 1 : 0);
-        const isCompliant = deviationRate <= (1 - COMPLIANCE_THRESHOLD) ? 1 : 0;
+        const adj = adjustedResults[resource.id] ? adjustedResults[resource.id][d.hour] : null;
+        if (!adj) continue;
 
-        totalAlloc += d.allocated_output_kw;
-        totalActual += actual;
-        totalPeriods++;
-        if (isCompliant) compliantPeriods++;
+        if (adj.is_compliant) compliantPeriods++;
+
+        const existingId = db.prepare(`
+          SELECT id FROM vpp_performance_records WHERE resource_id = ? AND trading_day_id = ? AND hour = ?
+        `).get(resource.id, tradingDayId, d.hour);
+
+        const recId = existingId ? existingId.id : uuidv4();
 
         db.prepare(`
           INSERT OR REPLACE INTO vpp_performance_records
-          (id, resource_id, trading_day_id, hour, allocated_output_kw, actual_output_kw, deviation_kw, deviation_rate, is_compliant)
-          VALUES (
-            COALESCE((SELECT id FROM vpp_performance_records WHERE resource_id = ? AND trading_day_id = ? AND hour = ?), ?),
-            ?, ?, ?, ?, ?, ?, ?, ?
-          )
+          (id, resource_id, trading_day_id, hour, allocated_output_kw, actual_output_kw,
+           raw_actual_output_kw, deviation_kw, deviation_rate, is_compliant,
+           redistributed_amount_kw, redistributed_to_deficit_kw)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
+          recId,
           resource.id, tradingDayId, d.hour,
-          uuidv4(),
-          resource.id, tradingDayId, d.hour,
-          d.allocated_output_kw, actual,
-          Math.round(deviation * 10000) / 10000,
-          Math.round(deviationRate * 10000) / 10000,
-          isCompliant
+          d.allocated_output_kw,
+          adj.adjusted_actual,
+          adj.raw_actual,
+          Math.round(adj.adjusted_deviation * 10000) / 10000,
+          Math.round(adj.adjusted_deviation_rate * 10000) / 10000,
+          adj.is_compliant,
+          Math.round(adj.redistributed_from_surplus * 10000) / 10000,
+          Math.round(adj.redistributed_to_deficit * 10000) / 10000
         );
 
         results.push({
@@ -683,10 +809,13 @@ function evaluatePerformanceAndRedistribute(aggregatorId, tradingDayId) {
           resource_name: resource.name,
           hour: d.hour,
           allocated_output_kw: d.allocated_output_kw,
-          actual_output_kw: actual,
-          deviation_kw: Math.round(deviation * 10000) / 10000,
-          deviation_rate: Math.round(deviationRate * 10000) / 10000,
-          is_compliant: isCompliant
+          actual_output_kw: adj.adjusted_actual,
+          raw_actual_output_kw: adj.raw_actual,
+          deviation_kw: Math.round(adj.adjusted_deviation * 10000) / 10000,
+          deviation_rate: Math.round(adj.adjusted_deviation_rate * 10000) / 10000,
+          is_compliant: adj.is_compliant,
+          redistributed_amount_kw: Math.round(adj.redistributed_from_surplus * 10000) / 10000,
+          redistributed_to_deficit_kw: Math.round(adj.redistributed_to_deficit * 10000) / 10000
         });
       }
 
@@ -743,28 +872,31 @@ function evaluatePerformanceAndRedistribute(aggregatorId, tradingDayId) {
 
   const hourlyMap = {};
   for (const r of results) {
-    if (!hourlyMap[r.hour]) hourlyMap[r.hour] = { hour: r.hour, total_alloc: 0, total_actual: 0, resources: [] };
+    if (!hourlyMap[r.hour]) hourlyMap[r.hour] = { hour: r.hour, total_alloc: 0, total_actual: 0, total_raw_actual: 0, resources: [] };
     hourlyMap[r.hour].total_alloc += r.allocated_output_kw;
     hourlyMap[r.hour].total_actual += r.actual_output_kw;
+    hourlyMap[r.hour].total_raw_actual += r.raw_actual_output_kw;
     hourlyMap[r.hour].resources.push(r);
   }
 
   const overall = {
     total_allocated_kw: 0,
     total_actual_kw: 0,
+    total_raw_actual_kw: 0,
     compliant_count: 0,
     non_compliant_count: 0
   };
   for (const r of results) {
     overall.total_allocated_kw += r.allocated_output_kw;
     overall.total_actual_kw += r.actual_output_kw;
+    overall.total_raw_actual_kw += r.raw_actual_output_kw;
     if (r.is_compliant) overall.compliant_count++;
     else overall.non_compliant_count++;
   }
   overall.overall_compliance_rate = results.length > 0
     ? Math.round(overall.compliant_count / results.length * 10000) / 10000
     : 0;
-  overall.overall_deviation_kw = Math.round((overall.total_actual_kw - overall.total_allocated_kw) * 10000) / 10000;
+  overall.overall_deviation_kw = Math.round((overall.total_raw_actual_kw - overall.total_allocated_kw) * 10000) / 10000;
   overall.overall_deviation_rate = overall.total_allocated_kw > 0
     ? Math.round(Math.abs(overall.overall_deviation_kw) / overall.total_allocated_kw * 10000) / 10000
     : 0;
