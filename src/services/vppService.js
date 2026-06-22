@@ -506,7 +506,7 @@ function getOutputDistribution(aggregatorId, tradingDayId) {
     FROM (
       SELECT *, ROW_NUMBER() OVER (
         PARTITION BY resource_id, hour
-        ORDER BY is_real_time_adjustment DESC, created_at DESC, id DESC
+        ORDER BY is_real_time_adjustment DESC, rowid DESC
       ) as rn
       FROM vpp_output_distributions
       WHERE aggregator_id = ? AND trading_day_id = ?
@@ -547,7 +547,7 @@ function getResourceOutputDistribution(resourceId, tradingDayId) {
     FROM (
       SELECT *, ROW_NUMBER() OVER (
         PARTITION BY resource_id, hour
-        ORDER BY is_real_time_adjustment DESC, created_at DESC, id DESC
+        ORDER BY is_real_time_adjustment DESC, rowid DESC
       ) as rn
       FROM vpp_output_distributions
       WHERE resource_id = ? AND trading_day_id = ?
@@ -1200,7 +1200,7 @@ function getCurrentOutputByHour(aggregatorId, tradingDayId, hour) {
     FROM (
       SELECT resource_id, allocated_output_kw, ROW_NUMBER() OVER (
         PARTITION BY resource_id
-        ORDER BY is_real_time_adjustment DESC, created_at DESC, id DESC
+        ORDER BY is_real_time_adjustment DESC, rowid DESC
       ) as rn
       FROM vpp_output_distributions
       WHERE aggregator_id = ? AND trading_day_id = ? AND hour = ?
