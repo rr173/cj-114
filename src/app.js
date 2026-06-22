@@ -18,6 +18,7 @@ const ftrRouter = require('./routes/ftr');
 const creditRouter = require('./routes/creditRoutes');
 const monthlyReportRouter = require('./routes/monthlyReportRoutes');
 const gridRouter = require('./routes/grid');
+const vppRouter = require('./routes/vpp');
 
 const app = express();
 
@@ -41,6 +42,7 @@ app.use('/api/ftr', ftrRouter);
 app.use('/api/credit', creditRouter);
 app.use('/api/monthly-reports', monthlyReportRouter);
 app.use('/api/grid', gridRouter);
+app.use('/api/vpp', vppRouter);
 
 app.get('/api/health', (req, res) => {
   res.json({

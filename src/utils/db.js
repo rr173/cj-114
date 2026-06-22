@@ -982,6 +982,154 @@ function initDatabase() {
       FOREIGN KEY (trading_day_id) REFERENCES trading_days(id),
       FOREIGN KEY (outage_line_id) REFERENCES grid_lines(id)
     );
+
+    CREATE TABLE IF NOT EXISTS vpp_aggregators (
+      id TEXT PRIMARY KEY,
+      code TEXT UNIQUE NOT NULL,
+      name TEXT NOT NULL,
+      participant_id TEXT NOT NULL,
+      contact_person TEXT,
+      contact_phone TEXT,
+      service_fee_ratio REAL NOT NULL DEFAULT 0.1,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (participant_id) REFERENCES market_participants(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS vpp_resources (
+      id TEXT PRIMARY KEY,
+      code TEXT UNIQUE NOT NULL,
+      name TEXT NOT NULL,
+      aggregator_id TEXT NOT NULL,
+      type TEXT NOT NULL CHECK(type IN ('storage', 'interruptible_load', 'solar_pv', 'charging_pile')),
+      rated_power_kw REAL NOT NULL,
+      is_reliable INTEGER NOT NULL DEFAULT 1,
+      owner_name TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (aggregator_id) REFERENCES vpp_aggregators(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS vpp_resource_states (
+      id TEXT PRIMARY KEY,
+      resource_id TEXT NOT NULL,
+      trading_day_id TEXT,
+      hour INTEGER CHECK(hour BETWEEN 0 AND 23),
+      availability_factor REAL CHECK(availability_factor BETWEEN 0 AND 1),
+      soc REAL CHECK(soc BETWEEN 0 AND 1),
+      max_charge_power_kw REAL,
+      max_discharge_power_kw REAL,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (resource_id) REFERENCES vpp_resources(id) ON DELETE CASCADE,
+      FOREIGN KEY (trading_day_id) REFERENCES trading_days(id),
+      UNIQUE(resource_id, trading_day_id, hour)
+    );
+
+    CREATE TABLE IF NOT EXISTS vpp_bids (
+      id TEXT PRIMARY KEY,
+      aggregator_id TEXT NOT NULL,
+      trading_day_id TEXT NOT NULL,
+      hour INTEGER NOT NULL CHECK(hour BETWEEN 0 AND 23),
+      adjustable_capacity_mw REAL NOT NULL,
+      price_yuan_per_mwh REAL NOT NULL,
+      cleared_capacity_mw REAL NOT NULL DEFAULT 0,
+      clearing_price REAL NOT NULL DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (aggregator_id) REFERENCES vpp_aggregators(id),
+      FOREIGN KEY (trading_day_id) REFERENCES trading_days(id),
+      UNIQUE(aggregator_id, trading_day_id, hour)
+    );
+
+    CREATE TABLE IF NOT EXISTS vpp_output_distributions (
+      id TEXT PRIMARY KEY,
+      aggregator_id TEXT NOT NULL,
+      trading_day_id TEXT NOT NULL,
+      hour INTEGER NOT NULL CHECK(hour BETWEEN 0 AND 23),
+      resource_id TEXT NOT NULL,
+      bid_id TEXT,
+      allocated_output_kw REAL NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (aggregator_id) REFERENCES vpp_aggregators(id),
+      FOREIGN KEY (trading_day_id) REFERENCES trading_days(id),
+      FOREIGN KEY (resource_id) REFERENCES vpp_resources(id),
+      FOREIGN KEY (bid_id) REFERENCES vpp_bids(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS vpp_actual_outputs (
+      id TEXT PRIMARY KEY,
+      resource_id TEXT NOT NULL,
+      trading_day_id TEXT NOT NULL,
+      hour INTEGER NOT NULL CHECK(hour BETWEEN 0 AND 23),
+      actual_output_kw REAL NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (resource_id) REFERENCES vpp_resources(id),
+      FOREIGN KEY (trading_day_id) REFERENCES trading_days(id),
+      UNIQUE(resource_id, trading_day_id, hour)
+    );
+
+    CREATE TABLE IF NOT EXISTS vpp_performance_records (
+      id TEXT PRIMARY KEY,
+      resource_id TEXT NOT NULL,
+      trading_day_id TEXT NOT NULL,
+      hour INTEGER NOT NULL CHECK(hour BETWEEN 0 AND 23),
+      allocated_output_kw REAL NOT NULL,
+      actual_output_kw REAL NOT NULL,
+      deviation_kw REAL NOT NULL,
+      deviation_rate REAL NOT NULL,
+      is_compliant INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (resource_id) REFERENCES vpp_resources(id),
+      FOREIGN KEY (trading_day_id) REFERENCES trading_days(id),
+      UNIQUE(resource_id, trading_day_id, hour)
+    );
+
+    CREATE TABLE IF NOT EXISTS vpp_performance_summary (
+      id TEXT PRIMARY KEY,
+      resource_id TEXT NOT NULL,
+      month TEXT NOT NULL,
+      total_periods INTEGER NOT NULL DEFAULT 0,
+      compliant_periods INTEGER NOT NULL DEFAULT 0,
+      non_compliant_periods INTEGER NOT NULL DEFAULT 0,
+      compliance_rate REAL NOT NULL DEFAULT 0,
+      consecutive_failures INTEGER NOT NULL DEFAULT 0,
+      is_marked_unreliable INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (resource_id) REFERENCES vpp_resources(id),
+      UNIQUE(resource_id, month)
+    );
+
+    CREATE TABLE IF NOT EXISTS vpp_settlements (
+      id TEXT PRIMARY KEY,
+      aggregator_id TEXT NOT NULL,
+      trading_day_id TEXT NOT NULL,
+      total_cleared_energy_mwh REAL NOT NULL DEFAULT 0,
+      total_actual_energy_mwh REAL NOT NULL DEFAULT 0,
+      deviation_energy_mwh REAL NOT NULL DEFAULT 0,
+      deviation_rate REAL NOT NULL DEFAULT 0,
+      spot_revenue_yuan REAL NOT NULL DEFAULT 0,
+      deviation_penalty_yuan REAL NOT NULL DEFAULT 0,
+      total_revenue_yuan REAL NOT NULL DEFAULT 0,
+      service_fee_yuan REAL NOT NULL DEFAULT 0,
+      distributable_revenue_yuan REAL NOT NULL DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (aggregator_id) REFERENCES vpp_aggregators(id),
+      FOREIGN KEY (trading_day_id) REFERENCES trading_days(id),
+      UNIQUE(aggregator_id, trading_day_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS vpp_revenue_allocations (
+      id TEXT PRIMARY KEY,
+      settlement_id TEXT NOT NULL,
+      aggregator_id TEXT NOT NULL,
+      trading_day_id TEXT NOT NULL,
+      resource_id TEXT NOT NULL,
+      actual_energy_mwh REAL NOT NULL DEFAULT 0,
+      contribution_ratio REAL NOT NULL DEFAULT 0,
+      allocated_revenue_yuan REAL NOT NULL DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (settlement_id) REFERENCES vpp_settlements(id) ON DELETE CASCADE,
+      FOREIGN KEY (aggregator_id) REFERENCES vpp_aggregators(id),
+      FOREIGN KEY (trading_day_id) REFERENCES trading_days(id),
+      FOREIGN KEY (resource_id) REFERENCES vpp_resources(id)
+    );
   `);
 }
 
