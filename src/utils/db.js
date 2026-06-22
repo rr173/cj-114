@@ -1004,4 +1004,27 @@ try {
   migrateSettlement();
 } catch (e) {}
 
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS monthly_market_reports (
+      id TEXT PRIMARY KEY,
+      month TEXT UNIQUE NOT NULL,
+      generated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      status TEXT NOT NULL DEFAULT 'final' CHECK(status IN ('draft', 'final')),
+      spot_market_data TEXT,
+      contract_data TEXT,
+      ancillary_service_data TEXT,
+      intraday_data TEXT,
+      green_certificate_data TEXT,
+      credit_margin_data TEXT,
+      summary_data TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    )
+  `);
+  console.log('[DB Migration] 月度报告表初始化完成');
+} catch (e) {
+  console.log('[DB Migration] 月度报告表初始化跳过:', e.message);
+}
+
 module.exports = db;
